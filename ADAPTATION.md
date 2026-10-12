@@ -1,3 +1,51 @@
+# Annex revision after the independent review — 2026-10-12
+
+This is a revision of the accepted Annex launch, not a rewrite. The only production source changed is
+`src/MarginaliaAnnex.sol`; the constructor, its four arguments, the launch shape (nonpayable, no external call,
+no owner / pause / upgrade / proxy / DELEGATECALL / CALLCODE / SELFDESTRUCT), every number in the brief and the
+Intake callback's write-set are as they were. `.imd-responses.json` answers each reported item. Each reopened
+finding was reproduced first with a test against the unchanged code (the three failed as the reviewer described),
+then fixed, then the test was kept in `test/Annex.t.sol`.
+
+## Reopened findings: reproduced and changed
+
+| Finding | Reproduced | Change in `src/MarginaliaAnnex.sol` | Test |
+| --- | --- | --- | --- |
+| `cc1b37a1` (high): one atomic dump → `observe` → rebuy inside a stranger's PoolManager unlock landed the window's most adverse reading, forfeited a RIGHT call and paid the manipulator 10%. | Yes: a 4,000,000 X dump, `observe`, rebuy and net-fee settlement in one unlock after three honest +32% readings settled `Wrong` (2 ≠ 1) and paid the attacker 0.2 IMD. | `observe` and `checkpointVenue` read the manager through `_lockedManager()`, which reverts `Unlocked` when the PoolManager's `Lock.IS_UNLOCKED_SLOT` (read with `exttload`) is set: no price is read from inside anyone's unlock, so a dumped reading has to be left standing for a later transaction. The settlement rule ("the most adverse decides") is unchanged. The checkpoint read is covered too (the review's path B: swap → checkpoint → unwind raising a window's extreme). | `testObservationInsideAnUnlockIsRefused` (the attacker's `observe` and `checkpointVenue` revert `Unlocked`, nothing lands, the window is unchanged, a dump left standing is still read, the standing extreme decides), `testHeldPriceStillSettlesRightAfterAFailedFlashRead` (RIGHT, bond back, nothing to the manipulator who settles). |
+| `baf2967b` (medium): pulling the venue's in-range liquidity for the window made every `observe` revert `EmptyPool`, so a WRONG (or sold) call settled `VoidNoData` and the whole bond came back. | Yes: a 10 IMD BUY call, the single LP removes its position at the horizon and re-adds it after the window; `observe` reverted, `settle` gave `VoidNoData` (4 ≠ 2) and `claimDeposit` returned 10 IMD. | `observe` checks the venue's liquidity first; when it is zero it records a reading with `xRead == 0` (no price) and the author's balance instead of reverting. `_moreAdverse` ranks such a reading above any price. `settle` treats any priceless reading as adverse: `Wrong` (bond forfeited, 10% to the settler, the rest to the pools), or `VoidSold` when the hold rule also failed. `VoidNoData` remains for a window with fewer than three readings or a pricer failure on real readings (a hub-leg problem), so a genuine no-observer window still refunds. | `testEmptiedVenueForfeitsInsteadOfRefunding` (BUY and SELL calls on an emptied venue: three priceless readings, a replacement is refused as not more adverse, `Wrong`, 1 IMD to the settler, 9 IMD to the pools, `claimDeposit` reverts), `testEmptiedVenueOnASoldBuyCallIsStillVoidSold`. `testNoObservationsVoidAndReturnTheBond` still passes. |
+| `552c2633` (medium): the baseline is max(window, this block's spot) for BUY / min for SELL with no author-side bound, so a pump landed just before the post (a sandwich) was recorded as the price to beat; a swap → checkpoint → unwind raised every BUY baseline for the rest of a window. | Yes: bob's 1,500,000 IMD pump in the same block before alice's post set `postPrice` 1.32e18 against an honest 1.0e18; after bob's dump and a real +25% the call settled `Wrong` (2 ≠ 1). | `post` takes a sixth argument, `baselineBound` (IMD per 1e18 of X; 0 = no bound), checked right after the baseline is read: a BUY call reverts `Slippage` when `postPrice > baselineBound`, a SELL call when `postPrice < baselineBound`, before anything is recorded (the pull and swap are in the same transaction, so nothing is taken). This is the shape the review proposed and the only interface change: `post(params, v4Key, bond, minMargOut, baselineBound, deadline)`; callers passing 0 get the previous behaviour. The checkpoint path of the finding is closed by the `Unlocked` rule above. Excluding the posting block's spot was not possible: the pricer is immutable and reads the spot itself, and dropping it would let an author post on a stale window after a real move. | `testBaselineBoundRefusesASandwichedPost` (the sandwiched post reverts with nothing taken; the same bound lands once the dump has happened; the call then settles RIGHT against a baseline the author accepted; a SELL bound from below). `AGENTS.md` and `README.md` document the argument. |
+
+## Advisory findings
+
+| Finding | Verdict | What was done |
+| --- | --- | --- |
+| `7c77dba1` (low): the author may settle their own forfeit and keep the 10% cut. | Reproduces as described; **disputed as a defect**. An exclusion by address is a second wallet away, so it would close nothing and cost bytes in a contract 75 bytes under EIP-170; the live hook has the same rule and the brief says "KEEPER_BPS 10% to the settler". | Stated in `AGENTS.md` (the cut goes to whoever settles first, the author included; retract forfeits everything with no cut). |
+| `0869bd11` (low): Intake v1 `request` with no failure callback, immutable intake / action / signer. | **Disputed** as a change to make: the brief fixes the four constructor values, Intake v1 and "no owner"; the previous round already recorded this (see below). | Trust and liveness assumptions stated in `AGENTS.md` for agents and in `README.md`; unchanged code. |
+| `dfe3edd0` (low): the hold rule reads `balanceOf` literally, so negative-rebasing tokens settle a held BUY call `VoidSold`. | Reproduces by inspection; **disputed** as a change: a tolerance is a number the brief does not have, and the hook documents the same rule. | Documented limitation in `AGENTS.md`: no BUY calls on tokens whose balances shrink without a transfer. |
+| `7842833a` (info): `noteOf` on an unknown id returned a zeroed view with status `Open`. | Yes: `noteOf(keccak256("nowhere"))` returned an empty struct. | **Fixed**: `noteOf` goes through `_note`, so an id this contract never issued reverts `NotOpen` (hook parity; the hook's error is `UnknownNote`). `_checkCounter` is unaffected. Test `testNoteOfAnUnknownIdReverts`. |
+
+## Validation (this revision)
+
+- `forge build`: passes. `MarginaliaAnnex` runtime **24,501 bytes** (EIP-170 limit 24,576; 75 bytes of headroom),
+  initcode 25,996 bytes.
+- `forge test --match-path test/Annex.t.sol`: **26 passed, 0 failed** (the 20 as accepted plus the 6 above).
+- `forge test --no-match-path 'test/{scratch,fork}/*'`: **289 passed, 0 failed** across 22 suites.
+- The supplied `Contracts.protected.t.sol` was copied unchanged to `test/scratch/` and run against the new creation
+  code with the four constructor arguments, a probe factory, chain id 1 and a CREATE2 salt whose address was
+  predicted with `cast create2`: **1 passed** (constructor runs in the empty EVM, runtime present, under EIP-170,
+  no DELEGATECALL / CALLCODE / SELFDESTRUCT). The copy is gone with scratch.
+- `testFullListFitsTheCallbackStipend` still delivers the four-hook answer under the Intake's 200k stipend; the
+  callback was not touched.
+- Residual, stated plainly: the `Unlocked` rule makes a manipulated reading survive a transaction boundary, not a
+  block. A builder bundle (dump, observe, rebuy as three transactions in one block) is still possible at the cost
+  of the round trip plus the bundle; the live hook carries the same exposure and the brief's settlement rule ("the
+  most adverse decides") was kept as instructed.
+- Not run: `test/fork/MainnetLaunch.t.sol` (no `MAINNET_RPC_URL`); no Slither, Mythril, broadcast or explorer
+  verification is claimed. No dependency, build configuration, submodule, `.git`, `.github`, environment file or
+  `node_modules` path changed.
+
+---
+
 # Annex launch (evm_contracts, Ethereum mainnet) — 2026-10-12
 
 This round makes `MarginaliaAnnex` (`src/MarginaliaAnnex.sol`) the contracts-only launch: ONE contract, constructor

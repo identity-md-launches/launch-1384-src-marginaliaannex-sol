@@ -112,7 +112,12 @@ The Annex launch (kind `evm_contracts`) deploys one contract, `MarginaliaAnnex`,
 arguments the live hook already holds: the hook `0xf0457dd0cf526686190e4f057ba19db14d34a0cc`, the Intake
 `0x1397434cd35e8a9C8aC312A61D3A285EB31dea56`, the action `bytes32("oracle.request@oracle-1")` and the oracle signer
 `0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982`. The constructor stores them and reads no chain state. There is no
-`launch.json` in this tree: the manifest step writes it. `test/Annex.t.sol` is the Annex suite.
+`launch.json` in this tree: the manifest step writes it. `test/Annex.t.sol` is the Annex suite. The independent review
+of 2026-10-12 changed three rules there, all in `MarginaliaAnnex`: observations and checkpoints are refused while the
+PoolManager is unlocked (no flash dump-observe-rebuy reading), a venue emptied of in-range liquidity records a priceless
+reading that settles as adverse (no refund by pulling liquidity), and `post` takes a `baselineBound` the author sets
+against a sandwiched baseline. The trust assumptions of the oracle-admission path (Intake v1, one fixed signer, no
+failure callback) are stated in `AGENTS.md`.
 
 Sealed notes: `seal(x, venue, hash)` commits to a note before it is posted. The seal pays one stamp up front
 (non-refundable, so a seal is never a free option), prices the venue's BUY and SELL baselines at that moment, and

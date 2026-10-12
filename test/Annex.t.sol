@@ -12,6 +12,12 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
 /// @dev The IMD launch factory's PoolInitializationGuard shape: beforeInitialize only (address bits 0x2000),
 /// so the hook can never touch a swap. Etched at a flagged address.
@@ -35,6 +41,51 @@ contract BlockedReadToken is MockERC20 {
     function balanceOf(address who) public view override returns (uint256) {
         require(!blocked[who], "blocked");
         return super.balanceOf(who);
+    }
+}
+
+/// @dev A manipulator: inside ONE PoolManager unlock it dumps X into the venue, calls the Annex (an observation
+/// or a checkpoint, as `action` says), buys the X back with the IMD it received and settles only the round
+/// trip's fee. No block passes and nobody can trade in between.
+contract FlashReader is IUnlockCallback {
+    IPoolManager immutable manager;
+    address immutable annex;
+
+    constructor(IPoolManager m, address a) {
+        manager = m;
+        annex = a;
+    }
+
+    function run(PoolKey memory key, bool xIs0, uint256 xIn, bytes memory action) external {
+        manager.unlock(abi.encode(key, xIs0, xIn, action));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        (PoolKey memory key, bool xIs0, uint256 xIn, bytes memory action) =
+            abi.decode(data, (PoolKey, bool, uint256, bytes));
+        BalanceDelta d1 = manager.swap(key, _params(xIs0, xIn), "");
+        uint256 imdOut = uint256(uint128(xIs0 ? d1.amount1() : d1.amount0()));
+        (bool ok, bytes memory ret) = annex.call(action);
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+        BalanceDelta d2 = manager.swap(key, _params(!xIs0, imdOut), "");
+        int256 net = int256(xIs0 ? d1.amount0() : d1.amount1()) + int256(xIs0 ? d2.amount0() : d2.amount1());
+        Currency xc = xIs0 ? key.currency0 : key.currency1;
+        manager.sync(xc);
+        IERC20(Currency.unwrap(xc)).transfer(address(manager), uint256(-net));
+        manager.settle();
+        return "";
+    }
+
+    function _params(bool zeroForOne, uint256 amountIn) private pure returns (SwapParams memory) {
+        return SwapParams(
+            zeroForOne,
+            -int256(amountIn),
+            zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+        );
     }
 }
 
@@ -81,6 +132,7 @@ contract AdmitIntake is IIntake {
 /// parity, counters against hook notes, and the Intake callback stipend.
 contract AnnexTest is Fixture {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     MarginaliaAnnex annex;
     AdmitIntake intake;
@@ -146,7 +198,7 @@ contract AnnexTest is Fixture {
 
     function _post(address who, T.NoteParams memory p, uint256 bond) internal returns (bytes32 id) {
         vm.prank(who);
-        id = annex.post(p, p.x == address(x) ? xKey : key, bond, 1, vm.getBlockTimestamp() + 1);
+        id = annex.post(p, p.x == address(x) ? xKey : key, bond, 1, 0, vm.getBlockTimestamp() + 1);
     }
 
     function _arec(address who) internal view returns (MarginaliaAnnex.Record memory r) {
@@ -238,13 +290,15 @@ contract AnnexTest is Fixture {
         // bond band and target rules are the hook's
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector);
-        annex.post(_xNote(T.Side.Buy, 12_000, 3, "t"), xKey, 0.1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(_xNote(T.Side.Buy, 12_000, 3, "t"), xKey, 0.1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector);
-        annex.post(_xNote(T.Side.Buy, 10_500, 3, "t"), xKey, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(_xNote(T.Side.Buy, 10_500, 3, "t"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector);
-        annex.post(_xNote(T.Side.Buy, 0, 3, "no theses here"), xKey, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(
+            _xNote(T.Side.Buy, 0, 3, "no theses here"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp() + 1
+        );
     }
 
     function testAgentClassForContractAuthors() public {
@@ -254,7 +308,7 @@ contract AnnexTest is Fixture {
         imd.approve(address(annex), type(uint256).max);
         vm.prank(address(agent));
         bytes32 id = annex.post(
-            _xNote(T.Side.Sell, 8_000, 1, "agent"), xKey, 0.25 ether, 1, vm.getBlockTimestamp() + 1
+            _xNote(T.Side.Sell, 8_000, 1, "agent"), xKey, 0.25 ether, 1, 0, vm.getBlockTimestamp() + 1
         );
         assertEq(annex.noteOf(id).class, uint8(T.Class.Agent));
     }
@@ -435,28 +489,28 @@ contract AnnexTest is Fixture {
         uint256 imdBefore = imd.balanceOf(alice);
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector);
-        annex.post(p, k, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(p, k, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         assertEq(imd.balanceOf(alice), imdBefore, "nothing taken");
         assertEq(annex.noteCount(), 0);
         // a SELL call on the same token holds nothing and posts
         p.side = T.Side.Sell;
         p.targetBps = 8_000;
         vm.prank(alice);
-        bytes32 id = annex.post(p, k, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        bytes32 id = annex.post(p, k, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         assertTrue(annex.noteOf(id).status == T.Status.Open);
         // and once the read works again, the BUY call posts with the real balance
         blk.setBlocked(alice, false);
         p.side = T.Side.Buy;
         p.targetBps = 12_000;
         vm.prank(alice);
-        id = annex.post(p, k, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        id = annex.post(p, k, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         assertEq(annex.noteOf(id).postBalance, 1_000 ether);
     }
 
     function testEmptyTextIsRefusedLikeTheHook() public {
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector);
-        annex.post(_xNote(T.Side.Buy, 12_000, 3, ""), xKey, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(_xNote(T.Side.Buy, 12_000, 3, ""), xKey, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
     }
 
     // ------------------------------------------------------------------ counters and seals
@@ -468,12 +522,12 @@ contract AnnexTest is Fixture {
         p.parentId = hookId;
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector); // not against yourself
-        annex.post(p, key, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(p, key, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         p.side = T.Side.Buy;
         p.targetBps = 12_000;
         vm.prank(bob);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector); // same side is not a counter
-        annex.post(p, key, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(p, key, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         p.side = T.Side.Sell;
         p.targetBps = 8_000;
         bytes32 counter = _post(bob, p, 1 ether);
@@ -483,7 +537,7 @@ contract AnnexTest is Fixture {
         q.parentId = counter;
         vm.prank(carol);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector); // different X
-        annex.post(q, xKey, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(q, xKey, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         q = _margNote(T.Side.Buy, 12_000, 3, "yes it will");
         q.parentId = counter;
         bytes32 c2 = _post(carol, q, 1 ether);
@@ -491,7 +545,7 @@ contract AnnexTest is Fixture {
         q.parentId = keccak256("nowhere");
         vm.prank(carol);
         vm.expectRevert(MarginaliaAnnex.InvalidNote.selector);
-        annex.post(q, key, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        annex.post(q, key, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
     }
 
     // ------------------------------------------------------------------ oracle admission
@@ -675,5 +729,196 @@ contract AnnexTest is Fixture {
         for (uint256 i = 0; i < 4; ++i) {
             assertTrue(annex.admittedHook(asked[i]));
         }
+    }
+
+    // ------------------------------------------------------------------ independent review (2026-10-12)
+
+    /// @dev cc1b37a1 (high): one atomic dump -> observe -> rebuy inside a stranger's unlock used to land the
+    /// most adverse reading of the window and forfeit a RIGHT call, paying the manipulator the settler's 10%.
+    /// An observation (and a checkpoint, the same read at post time) is refused while the PoolManager is
+    /// unlocked: a price has to be left standing for the next transaction to be read.
+    function testObservationInsideAnUnlockIsRefused() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up 20%"), 2 ether);
+        _pumpX(1_500_000 ether); // +32%, and it stays
+        vm.warp(annex.horizonEnd(id));
+        annex.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        annex.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 31 minutes);
+        annex.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        FlashReader f = new FlashReader(manager, address(annex));
+        x.transfer(address(f), 5_000_000 ether);
+        (,,,, uint256 xMaxBefore,,) = annex.priceWindows(annex.venueId(annex.venueOf(id)));
+        vm.expectRevert(MarginaliaAnnex.Unlocked.selector);
+        f.run(xKey, xIs0, 4_000_000 ether, abi.encodeCall(MarginaliaAnnex.observe, (id)));
+        assertEq(annex.observationsOf(id).length, 3, "nothing landed");
+        // the same read at post time: a swap -> checkpoint -> unwind cannot raise a window's extreme either
+        vm.expectRevert(MarginaliaAnnex.Unlocked.selector);
+        f.run(
+            xKey,
+            xIs0,
+            4_000_000 ether,
+            abi.encodeCall(MarginaliaAnnex.checkpointVenue, (_xNote(T.Side.Buy, 12_000, 1, "cp"), xKey))
+        );
+        (,,,, uint256 xMaxAfter,,) = annex.priceWindows(annex.venueId(annex.venueOf(id)));
+        assertEq(xMaxAfter, xMaxBefore, "the window is as it was");
+        // a dump that is left standing is a real reading, as before
+        x.transfer(bob, 3_000_000 ether);
+        vm.prank(bob);
+        plain.swap(xKey, xIs0, 3_000_000 ether, bob);
+        vm.roll(vm.getBlockNumber() + 25);
+        annex.observe(id);
+        assertEq(annex.observationsOf(id).length, 4);
+        vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
+        vm.prank(address(f));
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.Wrong, "the most adverse standing price decides");
+    }
+
+    function testHeldPriceStillSettlesRightAfterAFailedFlashRead() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up 20%"), 2 ether);
+        _pumpX(1_500_000 ether);
+        vm.warp(annex.horizonEnd(id));
+        annex.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        annex.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 31 minutes);
+        annex.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        FlashReader f = new FlashReader(manager, address(annex));
+        x.transfer(address(f), 5_000_000 ether);
+        vm.expectRevert(MarginaliaAnnex.Unlocked.selector);
+        f.run(xKey, xIs0, 4_000_000 ether, abi.encodeCall(MarginaliaAnnex.observe, (id)));
+        vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
+        uint256 fBefore = imd.balanceOf(address(f));
+        vm.prank(address(f));
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.Right, "right at every real block");
+        assertEq(imd.balanceOf(address(f)), fBefore, "nothing to the manipulator");
+        vm.prank(alice);
+        annex.claimDeposit(id);
+        assertEq(imd.balanceOf(address(annex)), 0);
+    }
+
+    /// @dev baf2967b (medium): pulling the venue's in-range liquidity for the window used to make every
+    /// observation revert, so a WRONG call settled VoidNoData and the bond came back. A reading on an emptied
+    /// venue is recorded with no price and is adverse to either side; fewer than three readings for want of an
+    /// observer still refund.
+    function testEmptiedVenueForfeitsInsteadOfRefunding() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up 20%"), 10 ether);
+        bytes32 sellId = _post(bob, _xNote(T.Side.Sell, 8_000, 1, "down 20%"), 1 ether);
+        vm.warp(annex.horizonEnd(id));
+        liquidity.add(xKey, -6000, 6000, -10_000_000 ether); // the single LP pulls everything
+        assertEq(manager.getLiquidity(xKey.toId()), 0);
+        annex.observe(id);
+        annex.observe(sellId);
+        T.Observation[] memory obs = annex.observationsOf(id);
+        assertEq(obs.length, 1);
+        assertEq(obs[0].xRead, 0, "no price");
+        assertEq(obs[0].balance, 1_000 ether, "the hold rule still reads");
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        annex.observe(id);
+        annex.observe(sellId);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 31 minutes);
+        annex.observe(id);
+        annex.observe(sellId);
+        vm.roll(vm.getBlockNumber() + 5); // too soon for a new slot: a replacement must be more adverse
+        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector); // nothing is more adverse than no price
+        annex.observe(id);
+        vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
+        liquidity.add(xKey, -6000, 6000, 10_000_000 ether); // and puts it back
+        uint256 poolsBefore = _pools();
+        uint256 carolBefore = imd.balanceOf(carol);
+        vm.prank(carol);
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.Wrong, "an emptied venue is adverse, not void");
+        assertEq(imd.balanceOf(carol) - carolBefore, 1 ether, "10% to the settler");
+        assertEq(_pools() - poolsBefore, 9 ether, "the rest to the pools");
+        assertEq(_arec(alice).wrong, 1);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.NothingToClaim.selector);
+        annex.claimDeposit(id);
+        vm.prank(carol);
+        annex.settle(sellId);
+        assertTrue(annex.noteOf(sellId).status == T.Status.Wrong, "adverse to a SELL call too");
+        assertEq(imd.balanceOf(address(annex)), 0);
+    }
+
+    function testEmptiedVenueOnASoldBuyCallIsStillVoidSold() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up 20%"), 1 ether);
+        vm.prank(alice);
+        plain.swap(xKey, xIs0, 100 ether, alice);
+        vm.warp(annex.horizonEnd(id));
+        liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
+        _observeAll(id);
+        vm.prank(bob);
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.VoidSold);
+        assertEq(_arec(alice).broken, 1);
+        assertEq(imd.balanceOf(address(annex)), 0, "forfeited");
+    }
+
+    /// @dev 552c2633 (medium): the baseline folds in the posting block's own spot, so a pump landed just before
+    /// the post (a sandwich) was recorded as the price to beat and the dump right after made the call
+    /// unwinnable. `baselineBound` lets the author bound the baseline as `minMargOut` bounds the MARG leg; a
+    /// sandwiched post reverts with nothing taken, and the bound is a no-op at zero.
+    function testBaselineBoundRefusesASandwichedPost() public {
+        T.Venue memory v = annex.validateVenue(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey);
+        assertEq(annex.postPrice(v, true), 1e18, "the honest baseline");
+        _pumpX(1_500_000 ether); // bob's pump lands first in the block
+        uint256 imdBefore = imd.balanceOf(alice);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.Slippage.selector);
+        annex.post(
+            _xNote(T.Side.Buy, 12_000, 1, "up 20%"), xKey, 2 ether, 1, 1.05e18, vm.getBlockTimestamp() + 1
+        );
+        assertEq(imd.balanceOf(alice), imdBefore, "nothing taken");
+        assertEq(annex.noteCount(), 0);
+        vm.prank(bob);
+        plain.swap(xKey, xIs0, x.balanceOf(bob), bob); // the dump
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.warp(vm.getBlockTimestamp() + 12);
+        assertLt(annex.postPrice(v, true), 1.05e18);
+        vm.prank(alice);
+        bytes32 id = annex.post(
+            _xNote(T.Side.Buy, 12_000, 1, "up 20%"), xKey, 2 ether, 1, 1.05e18, vm.getBlockTimestamp() + 1
+        );
+        assertLe(annex.noteOf(id).postPrice, 1.05e18, "judged against a baseline the author accepted");
+        _pumpX(1_000_000 ether); // then the market rises for real
+        _observeAll(id);
+        vm.prank(bob);
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.Right);
+        // a SELL call bounds the baseline from below (a fresh window: the last one expired with the horizon)
+        annex.checkpointVenue(_xNote(T.Side.Buy, 12_000, 1, "cp"), xKey);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.roll(vm.getBlockNumber() + 300);
+        vm.prank(bob);
+        plain.swap(xKey, xIs0, x.balanceOf(bob), bob);
+        vm.prank(carol);
+        vm.expectRevert(MarginaliaAnnex.Slippage.selector);
+        annex.post(
+            _xNote(T.Side.Sell, 8_000, 1, "down"), xKey, 1 ether, 1, 1.5e18, vm.getBlockTimestamp() + 1
+        );
+        vm.prank(carol);
+        annex.post(
+            _xNote(T.Side.Sell, 8_000, 1, "down"), xKey, 1 ether, 1, 0.5e18, vm.getBlockTimestamp() + 1
+        );
+        assertEq(annex.noteCount(), 2);
+    }
+
+    /// @dev 7842833a (info): an id this contract never issued reverts, as the hook's noteOf does.
+    function testNoteOfAnUnknownIdReverts() public {
+        vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
+        annex.noteOf(keccak256("nowhere"));
+        vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
+        annex.horizonEnd(keccak256("nowhere"));
     }
 }
