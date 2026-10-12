@@ -3,7 +3,7 @@ pragma solidity 0.8.26;
 
 import {VmSafe} from "forge-std/Vm.sol";
 import {Fixture, MockERC20} from "./helpers/Fixture.sol";
-import {GuardHook, AdmitIntake, BlockedReadToken} from "./Annex.t.sol";
+import {GuardHook, AdmitIntake, BlockedReadToken, FreeSwapper} from "./Annex.t.sol";
 import {MarginaliaAnnex, IMarginaliaHookAnnex} from "../src/MarginaliaAnnex.sol";
 import {MarginaliaPricer} from "../src/MarginaliaPricer.sol";
 import {MarginaliaTypes as T} from "../src/MarginaliaTypes.sol";
@@ -17,6 +17,7 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
 /// @dev A stranger holding the PoolManager's lock who tries to drive the Annex's unlockCallback from inside it.
 contract StrangerUnlocker is IUnlockCallback {
@@ -695,13 +696,11 @@ contract AnnexAdversarialTest is Fixture {
         assertTrue(annex.noteOf(id).status == T.Status.Wrong);
     }
 
-    // ------------------------------------------------------------------ priceless readings (baf2967b)
+    // ------------------------------------------------------------------ standing prices without liquidity
 
-    /// @dev On a venue whose LP pulled every position, a reading has no price. Its place in the replacement
-    /// order: a hold breach still outranks it, it outranks any price, and once it is the last slot no price
-    /// (however adverse) replaces it. The sold-out case (price past a concentrated range, liquidity zero
-    /// without a pull) is reported separately: it settles a right call WRONG and is not asserted here.
-    function testPricelessReadingsRankBelowABreachAndAboveAnyPrice() public {
+    /// @dev Pulling liquidity does not move slot0 or make an equal price more adverse. Subsequent trades
+    /// still replace a reading only against the call's side, and a hold breach outranks every held reading.
+    function testStandingReadingsKeepPriceOrderingAndHoldBreachPriority() public {
         bytes32 buy = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up"), 1 ether);
         bytes32 sell = _post(bob, _xNote(T.Side.Sell, 8_000, 1, "down"), 1 ether);
         _pumpX(1_500_000 ether); // +32%: right for the BUY call, adverse for the SELL call
@@ -710,41 +709,71 @@ contract AnnexAdversarialTest is Fixture {
         annex.observe(sell);
         uint256 priced = annex.observationsOf(buy)[0].xRead;
         assertGt(priced, 0);
-        // the LP pulls everything in the same block: a priceless reading replaces a priced one on both sides
+        // The LP pulls everything in the same block: the unchanged price replaces neither side.
         liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
         assertEq(manager.getLiquidity(xKey.toId()), 0);
-        annex.observe(buy);
-        annex.observe(sell);
-        assertEq(annex.observationsOf(buy).length, 1, "replaced, not appended");
-        assertEq(annex.observationsOf(buy)[0].xRead, 0);
-        assertEq(annex.observationsOf(buy)[0].balance, 1_000 ether, "the hold rule still reads");
-        assertEq(annex.observationsOf(sell)[0].xRead, 0);
-        // liquidity back and the price pushed hard against each side: a price never replaces no price
-        liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
-        _dumpX(bob, 1_000_000 ether); // far below par: the most adverse price a BUY call can see
         vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
         annex.observe(buy);
-        _pumpX(3_000_000 ether); // far above: the most adverse a SELL call can see
         vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
         annex.observe(sell);
-        // a hold breach still outranks it
-        _dumpX(alice, 1 ether);
-        annex.observe(buy);
         assertEq(annex.observationsOf(buy).length, 1);
-        assertLt(annex.observationsOf(buy)[0].balance, 1_000 ether);
-        assertGt(annex.observationsOf(buy)[0].xRead, 0, "the breach reading carries the live price");
-        // and the breach is never replaced by a priceless, held reading
+        assertEq(annex.observationsOf(sell).length, 1);
+        // After the gap the empty pool supplies the very same price as the liquid one did.
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        annex.observe(buy);
+        annex.observe(sell);
+        assertEq(annex.observationsOf(buy)[1].xRead, priced);
+        assertEq(annex.observationsOf(sell)[1].xRead, priced);
+        assertEq(annex.observationsOf(buy)[1].quoteRead, 1e18);
+        assertEq(annex.observationsOf(buy)[1].balance, 1_000 ether, "the hold rule still reads");
+        // Liquidity back and the price pushed against BUY: replace BUY, refuse the favourable SELL reading.
+        liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
+        _dumpX(bob, 1_000_000 ether);
+        annex.observe(buy);
+        assertLt(annex.observationsOf(buy)[1].xRead, priced);
+        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
+        annex.observe(sell);
+        _pumpX(3_000_000 ether);
+        annex.observe(sell);
+        assertGt(annex.observationsOf(sell)[1].xRead, priced);
+        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
+        annex.observe(buy);
+        // A hold breach replaces even the lower BUY price; a transfer suffices without another swap.
+        vm.prank(alice);
+        x.transfer(carol, 1 ether);
+        annex.observe(buy);
+        assertEq(annex.observationsOf(buy).length, 2, "replacement preserves the slot count");
+        assertLt(annex.observationsOf(buy)[1].balance, 1_000 ether);
+        assertGt(annex.observationsOf(buy)[1].xRead, priced);
+        // Restoring the balance and pulling the pool cannot erase the breach, even at a lower price.
         x.transfer(alice, 1 ether);
         liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
+        FreeSwapper free = new FreeSwapper(manager);
+        free.push(xKey, uint160(1 << 96));
         vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
         annex.observe(buy);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 31 minutes);
+        annex.observe(buy);
+        annex.observe(sell);
+        vm.warp(annex.horizonEnd(buy) + annex.SETTLE_WINDOW() + 1);
+        uint256 poolsBefore = _hookPools();
+        uint256 keeperBefore = imd.balanceOf(carol);
+        vm.prank(carol);
+        annex.settle(buy);
+        vm.prank(carol);
+        annex.settle(sell);
+        assertTrue(annex.noteOf(buy).status == T.Status.VoidSold, "a restored balance cannot erase a breach");
+        assertTrue(annex.noteOf(sell).status == T.Status.Wrong, "the higher reading decides SELL");
+        assertEq(imd.balanceOf(carol) - keeperBefore, 0.2 ether);
+        assertEq(_hookPools() - poolsBefore, 1.8 ether);
+        assertEq(imd.balanceOf(address(annex)), 0);
         liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
     }
 
-    /// @dev Priceless readings are readings: two of them are still fewer than three, so an LP pull that nobody
-    /// bothers to observe three times stays VoidNoData (the bond returns), and a series of three that spans
-    /// under an hour too.
-    function testFewerThanThreePricelessReadingsAreStillNoData() public {
+    /// @dev Standing prices still need three readings: an LP pull observed only twice is VoidNoData.
+    function testFewerThanThreeStandingReadingsAreStillNoData() public {
         bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up"), 2 ether);
         vm.warp(annex.horizonEnd(id));
         liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
@@ -753,6 +782,8 @@ contract AnnexAdversarialTest is Fixture {
         vm.warp(vm.getBlockTimestamp() + 2 hours);
         annex.observe(id);
         assertEq(annex.observationsOf(id).length, 2);
+        assertEq(annex.observationsOf(id)[0].xRead, 1e18);
+        assertEq(annex.observationsOf(id)[1].xRead, 1e18);
         vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
         uint256 poolsBefore = _hookPools();
         vm.prank(bob);
@@ -763,6 +794,53 @@ contract AnnexAdversarialTest is Fixture {
         annex.claimDeposit(id);
         assertEq(imd.balanceOf(address(annex)), 0);
         liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
+    }
+
+    /// @dev The sell-side counterpart of the sold-out BUY regression. Positions remain in the pool, but
+    /// the price is below their range; the highest reading (the range edge) is still below the SELL target.
+    function testSoldOutSellCallReturnsItsBond() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Sell, 8_000, 1, "down 20%"), 10 ether);
+        x.transfer(bob, 4_000_000 ether);
+        _dumpX(bob, 4_000_000 ether);
+        assertEq(manager.getLiquidity(xKey.toId()), 0, "traded beyond the range, without an LP pull");
+        uint256 end = annex.horizonEnd(id);
+        vm.warp(end);
+        annex.observe(id);
+        assertEq(annex.observationsOf(id)[0].xRead, 1, "the low extreme remains an observation");
+
+        FreeSwapper free = new FreeSwapper(manager);
+        uint160 edge = TickMath.getSqrtPriceAtTick(xIs0 ? int24(-6000) : int24(6000));
+        free.push(xKey, edge);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(end + 30 minutes);
+        annex.observe(id);
+        uint256 edgePrice = annex.observationsOf(id)[1].xRead;
+        assertGt(edgePrice, 0.54e18);
+        assertLt(edgePrice, 0.55e18, "even the adverse range edge is below the 0.8 target");
+
+        free.push(xKey, xIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(end + 1 hours);
+        annex.observe(id);
+        assertEq(annex.observationsOf(id)[2].xRead, 1);
+        vm.warp(end + 6 hours + 1);
+        uint256 poolsBefore = _hookPools();
+        uint256 keeperBefore = imd.balanceOf(carol);
+        vm.prank(carol);
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.Right);
+        assertEq(_arec(alice).right, 1);
+        assertGt(_arec(alice).score, 0);
+        assertEq(_hookPools(), poolsBefore);
+        assertEq(imd.balanceOf(carol), keeperBefore);
+        uint256 before = imd.balanceOf(alice);
+        vm.prank(alice);
+        annex.claimDeposit(id);
+        assertEq(imd.balanceOf(alice) - before, 10 ether);
+        assertEq(imd.balanceOf(address(annex)), 0);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.NothingToClaim.selector);
+        annex.claimDeposit(id);
     }
 
     /// @dev The case the rule was written for: a call that is already wrong on two standing prices cannot be

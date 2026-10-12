@@ -170,8 +170,9 @@ abstract contract Fixture is Test {
 
     function _deployHook(IPoolManager m, address t) internal returns (MarginaliaHook result) {
         _etchImpls();
-        bytes memory code =
-            abi.encodePacked(type(MarginaliaHook).creationCode, abi.encode(m, t, address(this)));
+        bytes memory code = abi.encodePacked(
+            vm.getCode("MarginaliaHook.sol:MarginaliaHook"), abi.encode(m, t, address(this))
+        );
         bytes32 hash = keccak256(code);
         for (uint256 i = 0; i < 300_000; ++i) {
             bytes32 salt = bytes32(i);
