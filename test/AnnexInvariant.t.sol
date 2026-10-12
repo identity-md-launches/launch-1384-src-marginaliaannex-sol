@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test, console} from "forge-std/Test.sol";
-import {Fixture, MockERC20, TestSwapRouter} from "./helpers/Fixture.sol";
+import {Fixture, MockERC20, TestSwapRouter, LiquidityHelper} from "./helpers/Fixture.sol";
 import {GuardHook, AdmitIntake} from "./Annex.t.sol";
 import {MarginaliaAnnex, IMarginaliaHookAnnex} from "../src/MarginaliaAnnex.sol";
 import {MarginaliaHook} from "../src/MarginaliaHook.sol";
@@ -14,12 +14,15 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
-/// @dev Drives the Annex with real posts, trades, observations, settlements, retractions, claims and oracle
-/// admissions in random order, keeping its own ledger of every bond. Nothing is injected into contract storage
-/// and no read is mocked: the ledger is what the contract must agree with after every sequence.
+/// @dev Drives the Annex with real posts, trades, observations, settlements, retractions, claims, oracle
+/// admissions and the venue's LP pulling and refilling its positions, in random order, keeping its own ledger
+/// of every bond. Nothing is injected into contract storage and no read is mocked: the ledger is what the
+/// contract must agree with after every sequence.
 contract AnnexHandler is Test {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     MarginaliaAnnex public immutable annex;
     MarginaliaHook public immutable hook;
@@ -29,6 +32,7 @@ contract AnnexHandler is Test {
     IERC20 public immutable marg;
     MockERC20 public immutable x;
     TestSwapRouter public immutable plain;
+    LiquidityHelper public immutable liquidity;
     PoolKey internal xKey;
     PoolKey internal margKey;
     bool internal immutable xIs0;
@@ -63,8 +67,14 @@ contract AnnexHandler is Test {
     uint256 public calls;
     uint256 public posts;
     uint256 public settles;
+    uint256 public boundedPosts;
+    uint256 public pricelessReadings;
+    uint256 public observationsLanded;
+    uint256 public observationsTooLate;
+    uint256 public observationsRefused;
     uint256 public hookPoolsAtStart;
     uint256 internal admissionNonce;
+    bool public venueEmptied; // the X venue's two positions are pulled (held by the helper until refilled)
 
     constructor(
         MarginaliaAnnex annex_,
@@ -75,6 +85,7 @@ contract AnnexHandler is Test {
         IERC20 marg_,
         MockERC20 x_,
         TestSwapRouter plain_,
+        LiquidityHelper liquidity_,
         PoolKey memory xKey_,
         PoolKey memory margKey_,
         address[3] memory actors_,
@@ -88,6 +99,7 @@ contract AnnexHandler is Test {
         marg = marg_;
         x = x_;
         plain = plain_;
+        liquidity = liquidity_;
         xKey = xKey_;
         margKey = margKey_;
         xIs0 = Currency.unwrap(xKey_.currency0) == address(x_);
@@ -152,6 +164,27 @@ contract AnnexHandler is Test {
         return (bytes32(0), false);
     }
 
+    /// @dev An open note whose settlement window can still be reached: not yet past the horizon when
+    /// `beforeEnd` (a full series needs the whole window), not yet past the window otherwise.
+    function _observable(uint256 seed, bool beforeEnd, bool preferX)
+        internal
+        view
+        returns (bytes32 id, bool found)
+    {
+        uint256 n = ids.length;
+        if (n == 0) return (bytes32(0), false);
+        bytes32 other;
+        for (uint256 i = 0; i < n; ++i) {
+            id = ids[(seed % n + i) % n];
+            if (bonds[id].status != T.Status.Open) continue;
+            uint256 end = annex.horizonEnd(id);
+            if (vm.getBlockTimestamp() > (beforeEnd ? end : end + 6 hours)) continue;
+            if (!preferX || annex.noteOf(id).x == address(x)) return (id, true);
+            if (other == bytes32(0)) other = id;
+        }
+        return other == bytes32(0) ? (bytes32(0), false) : (other, true);
+    }
+
     function _claimable(uint256 seed) internal view returns (bytes32 id, bool found) {
         uint256 n = ids.length;
         if (n == 0) return (bytes32(0), false);
@@ -167,13 +200,19 @@ contract AnnexHandler is Test {
 
     // ------------------------------------------------------------------ actions
 
+    /// @dev `bounded` quotes the baseline the contract itself would use and passes it as `baselineBound`: a
+    /// bound at the quoted baseline must never be refused as slippage (the check is inclusive), and the note
+    /// must then carry exactly that baseline. On the MARG venue the post's own 0.35 IMD purchase moves the
+    /// spot before the baseline is read, so there the quote gets the 1% an agent is told to allow and the
+    /// recorded baseline must sit inside it.
     function post(
         uint256 actorSeed,
         bool onMarg,
         bool buy,
         uint32 targetSeed,
         uint16 horizonSeed,
-        uint256 bondSeed
+        uint256 bondSeed,
+        bool bounded
     ) external {
         calls++;
         address who = _actor(actorSeed);
@@ -183,9 +222,17 @@ contract AnnexHandler is Test {
         uint256 bond = bound(bondSeed, 0.25 ether, 10 ether);
         (T.NoteParams memory p, PoolKey memory k) = _params(onMarg, buy, targetBps, horizonDays);
         if (!_ensureWindow(p, k)) return;
+        uint256 baselineBound;
+        if (bounded) {
+            try annex.postPrice(annex.validateVenue(p, k), buy) returns (uint256 quoted) {
+                baselineBound = !onMarg ? quoted : buy ? quoted * 101 / 100 : quoted * 99 / 100;
+            } catch {
+                return;
+            }
+        }
         uint256 before = imd.balanceOf(address(annex));
         vm.prank(who);
-        try annex.post(p, k, bond, 0, vm.getBlockTimestamp()) returns (bytes32 id) {
+        try annex.post(p, k, bond, 0, baselineBound, vm.getBlockTimestamp()) returns (bytes32 id) {
             posts++;
             ids.push(id);
             bonds[id] = Bond(who, bond, bond, T.Status.Open, vm.getBlockTimestamp());
@@ -194,29 +241,78 @@ contract AnnexHandler is Test {
             assertEq(imd.balanceOf(address(annex)) - before, bond, "a post leaves exactly the bond behind");
             assertEq(annex.noteOf(id).deposit, bond);
             assertTrue(annex.noteOf(id).status == T.Status.Open);
-        } catch {
+            if (bounded) {
+                boundedPosts++;
+                uint256 recorded = annex.noteOf(id).postPrice;
+                if (!onMarg) {
+                    assertEq(recorded, baselineBound, "the quoted baseline is the recorded one");
+                } else if (buy) {
+                    assertLe(recorded, baselineBound, "a BUY baseline inside the bound");
+                } else {
+                    assertGe(recorded, baselineBound, "a SELL baseline inside the bound");
+                }
+            }
+        } catch (bytes memory reason) {
             assertEq(imd.balanceOf(address(annex)), before, "a failed post moves nothing");
+            if (bounded) {
+                assertTrue(
+                    bytes4(reason) != MarginaliaAnnex.Slippage.selector,
+                    "a bound at the quoted baseline is never slippage"
+                );
+            }
         }
     }
 
-    function observe(uint256 idSeed, uint256 dtSeed) external {
+    /// @dev One reading inside the window of a note that can still be observed; `pullFirst` has the venue's LP
+    /// pull its positions before the reading, so priceless readings happen in the sequences too.
+    function observe(uint256 idSeed, uint256 dtSeed, bool pullFirst) external {
         calls++;
-        (bytes32 id, bool found) = _open(idSeed);
+        (bytes32 id, bool found) = _observable(idSeed, false, pullFirst);
         if (!found) return;
+        if (pullFirst && !venueEmptied) this.pullOrRefillVenue(false);
         uint256 end = annex.horizonEnd(id);
         uint256 target = end + bound(dtSeed, 0, 6 hours);
         if (target > vm.getBlockTimestamp()) vm.warp(target);
         vm.roll(vm.getBlockNumber() + 25);
-        try annex.observe(id) {} catch {}
+        try annex.observe(id) {
+            observationsLanded++;
+            T.Observation[] memory obs = annex.observationsOf(id);
+            T.Observation memory last = obs[obs.length - 1];
+            bool emptied = manager.getLiquidity(PoolId.wrap(annex.venueOf(id).ref)) == 0;
+            assertEq(
+                last.xRead == 0, emptied, "a reading has no price exactly when the venue has no liquidity"
+            );
+            if (emptied) pricelessReadings++;
+        } catch (bytes memory reason) {
+            if (bytes4(reason) == MarginaliaAnnex.TooLate.selector) observationsTooLate++;
+            else observationsRefused++;
+        }
+    }
+
+    /// @dev The X venue's LP pulls both positions, or puts them back: posts on it are refused meanwhile, open
+    /// calls on it read no price, and the bond ledger must still balance whatever that does to outcomes.
+    function pullOrRefillVenue(bool refill) external {
+        calls++;
+        if (refill != venueEmptied) return; // nothing to refill, or nothing left to pull
+        if (refill) {
+            liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
+            liquidity.add(xKey, -887_220, 887_220, 1_000_000 ether);
+            venueEmptied = false;
+            assertGt(manager.getLiquidity(xKey.toId()), 0);
+        } else {
+            liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
+            liquidity.add(xKey, -887_220, 887_220, -1_000_000 ether);
+            venueEmptied = true;
+            assertEq(manager.getLiquidity(xKey.toId()), 0);
+        }
     }
 
     /// @dev A keeper's full series: three readings 25 blocks apart spanning an hour, so settlement has data.
     function observeSeries(uint256 idSeed) external {
         calls++;
-        (bytes32 id, bool found) = _open(idSeed);
+        (bytes32 id, bool found) = _observable(idSeed, true, false);
         if (!found) return;
         uint256 end = annex.horizonEnd(id);
-        if (vm.getBlockTimestamp() > end) return; // the window may already be partly spent: leave it to observe()
         vm.warp(end);
         vm.roll(vm.getBlockNumber() + 25);
         try annex.observe(id) {} catch {}
@@ -487,6 +583,7 @@ contract AnnexInvariantTest is Fixture {
             IERC20(address(token)),
             x,
             plain,
+            liquidity,
             xKey,
             key,
             actors,
@@ -500,6 +597,9 @@ contract AnnexInvariantTest is Fixture {
         console.log("posts", handler.posts(), "settles", handler.settles());
         console.log("claimed", handler.claimed(), "forfeited to pools", handler.toPools());
         console.log("keeper paid", handler.keeperPaid(), "admitted hooks", handler.admittedCount());
+        console.log(
+            "bounded posts", handler.boundedPosts(), "priceless readings", handler.pricelessReadings()
+        );
     }
 
     /// @dev What the annex holds is exactly what it still owes: every open, right or no-data bond, nothing else.

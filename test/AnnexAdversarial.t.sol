@@ -16,6 +16,7 @@ import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.s
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
 /// @dev A stranger holding the PoolManager's lock who tries to drive the Annex's unlockCallback from inside it.
 contract StrangerUnlocker is IUnlockCallback {
@@ -48,6 +49,7 @@ contract StrangerUnlocker is IUnlockCallback {
 /// signing vector, and the shape the launcher rehearses (an empty-chain constructor under EIP-170).
 contract AnnexAdversarialTest is Fixture {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     MarginaliaAnnex annex;
     AdmitIntake intake;
@@ -119,7 +121,7 @@ contract AnnexAdversarialTest is Fixture {
 
     function _post(address who, T.NoteParams memory p, uint256 bond) internal returns (bytes32 id) {
         vm.prank(who);
-        id = annex.post(p, p.x == address(x) ? xKey : key, bond, 1, vm.getBlockTimestamp() + 1);
+        id = annex.post(p, p.x == address(x) ? xKey : key, bond, 1, 0, vm.getBlockTimestamp() + 1);
     }
 
     function _postExpect(address who, T.NoteParams memory p, uint256 bond, bytes4 err) internal {
@@ -131,7 +133,7 @@ contract AnnexAdversarialTest is Fixture {
         returns (bytes32 id)
     {
         vm.prank(who);
-        id = annex.post(p, k, bond, 1, vm.getBlockTimestamp() + 1);
+        id = annex.post(p, k, bond, 1, 0, vm.getBlockTimestamp() + 1);
     }
 
     function _postExpectWith(address who, T.NoteParams memory p, PoolKey memory k, uint256 bond, bytes4 err)
@@ -139,7 +141,7 @@ contract AnnexAdversarialTest is Fixture {
     {
         vm.prank(who);
         vm.expectRevert(err);
-        annex.post(p, k, bond, 1, vm.getBlockTimestamp() + 1);
+        annex.post(p, k, bond, 1, 0, vm.getBlockTimestamp() + 1);
     }
 
     /// @dev Reopens the X venue's window after a long warp (windows expire after six hours).
@@ -289,10 +291,10 @@ contract AnnexAdversarialTest is Fixture {
         );
         // deadline: now is fine, a second ago is not
         vm.prank(alice);
-        annex.post(_xNote(T.Side.Buy, 12_000, 1, "now"), xKey, 1 ether, 1, vm.getBlockTimestamp());
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "now"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp());
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.Expired.selector);
-        annex.post(_xNote(T.Side.Buy, 12_000, 1, "late"), xKey, 1 ether, 1, vm.getBlockTimestamp() - 1);
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "late"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp() - 1);
         assertEq(annex.noteCount(), 4);
         assertEq(_arec(alice).posted, 4);
     }
@@ -303,7 +305,7 @@ contract AnnexAdversarialTest is Fixture {
         vm.prank(alice);
         vm.expectRevert(MarginaliaAnnex.Slippage.selector);
         annex.post(
-            _xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, type(uint128).max, vm.getBlockTimestamp()
+            _xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, type(uint128).max, 0, vm.getBlockTimestamp()
         );
         assertEq(imd.balanceOf(alice), imdBefore);
         assertEq(token.balanceOf(alice), margBefore);
@@ -311,26 +313,111 @@ contract AnnexAdversarialTest is Fixture {
         assertEq(imd.balanceOf(address(annex)), 0);
         // minMargOut == 0 is the author's choice and posts
         vm.prank(alice);
-        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 0, vm.getBlockTimestamp());
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 0, 0, vm.getBlockTimestamp());
         // a wallet with no IMD, or no allowance, cannot post
         address poor = makeAddr("poor");
         vm.prank(poor);
         vm.expectRevert();
-        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, vm.getBlockTimestamp());
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp());
         imd.transfer(poor, 10 ether);
         vm.prank(poor);
         vm.expectRevert();
-        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, vm.getBlockTimestamp());
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp());
         vm.prank(poor);
         imd.approve(address(annex), 1.35 ether - 1);
         vm.prank(poor);
         vm.expectRevert();
-        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, vm.getBlockTimestamp());
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp());
         vm.prank(poor);
         imd.approve(address(annex), 1.35 ether);
         vm.prank(poor);
-        annex.post(_xNote(T.Side.Buy, 12_000, 1, "exactly 1.35"), xKey, 1 ether, 1, vm.getBlockTimestamp());
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "exactly 1.35"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp());
         assertEq(imd.balanceOf(poor), 10 ether - 1.35 ether);
+    }
+
+    /// @dev The sixth argument, at its edges: a bound equal to the baseline passes on either side (the check
+    /// is strict past the bound, not at it), one wei inside it refuses with nothing taken, and zero is no bound
+    /// at all, however far the baseline sits.
+    function testBaselineBoundIsInclusiveAtTheBaselineAndOffAtZero() public {
+        T.Venue memory v = annex.validateVenue(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey);
+        uint256 buyBase = annex.postPrice(v, true);
+        uint256 sellBase = annex.postPrice(v, false);
+        assertGt(buyBase, 0);
+        // exactly the baseline: posts
+        vm.prank(alice);
+        bytes32 id = annex.post(
+            _xNote(T.Side.Buy, 12_000, 1, "at the bound"), xKey, 1 ether, 1, buyBase, vm.getBlockTimestamp()
+        );
+        assertEq(annex.noteOf(id).postPrice, buyBase);
+        vm.prank(alice);
+        id = annex.post(
+            _xNote(T.Side.Sell, 8_000, 1, "at the bound"), xKey, 1 ether, 1, sellBase, vm.getBlockTimestamp()
+        );
+        assertEq(annex.noteOf(id).postPrice, sellBase);
+        // one wei past it: refused, and the MARG leg that ran first is unwound with the rest
+        uint256 imdBefore = imd.balanceOf(alice);
+        uint256 margBefore = token.balanceOf(alice);
+        uint256 deadBefore = token.balanceOf(annex.DEAD());
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.Slippage.selector);
+        annex.post(
+            _xNote(T.Side.Buy, 12_000, 1, "too tight"), xKey, 1 ether, 1, buyBase - 1, vm.getBlockTimestamp()
+        );
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.Slippage.selector);
+        annex.post(
+            _xNote(T.Side.Sell, 8_000, 1, "too tight"), xKey, 1 ether, 1, sellBase + 1, vm.getBlockTimestamp()
+        );
+        assertEq(imd.balanceOf(alice), imdBefore, "nothing taken");
+        assertEq(token.balanceOf(alice), margBefore, "no MARG delivered");
+        assertEq(token.balanceOf(annex.DEAD()), deadBefore, "nothing burned");
+        assertEq(annex.noteCount(), 2);
+        assertEq(_arec(alice).posted, 2, "a refused post is not counted");
+        // a bound of 1 wei on a SELL call and of max on a BUY call are no constraint; zero is none either
+        _pumpX(1_500_000 ether); // the sandwich: the BUY baseline is now above par
+        assertGt(annex.postPrice(v, true), buyBase);
+        vm.prank(alice);
+        id = annex.post(
+            _xNote(T.Side.Buy, 12_000, 1, "unbounded"), xKey, 1 ether, 1, 0, vm.getBlockTimestamp()
+        );
+        assertGt(annex.noteOf(id).postPrice, buyBase, "zero accepts the pumped baseline");
+        vm.prank(alice);
+        annex.post(
+            _xNote(T.Side.Buy, 12_000, 1, "max"), xKey, 1 ether, 1, type(uint256).max, vm.getBlockTimestamp()
+        );
+        vm.prank(alice);
+        annex.post(_xNote(T.Side.Sell, 8_000, 1, "one wei"), xKey, 1 ether, 1, 1, vm.getBlockTimestamp());
+        assertEq(annex.noteCount(), 5);
+    }
+
+    /// @dev The bound is checked against the side's own baseline: a BUY call's baseline is the window's
+    /// maximum, a SELL call's the minimum, so after one pump and one dump the two sides see two prices and a
+    /// bound that fits one refuses the other.
+    function testBaselineBoundReadsTheSidesOwnBaseline() public {
+        _pumpX(1_500_000 ether);
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.warp(vm.getBlockTimestamp() + 12);
+        _dumpX(bob, x.balanceOf(bob));
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.warp(vm.getBlockTimestamp() + 12);
+        annex.checkpointVenue(_xNote(T.Side.Buy, 12_000, 1, "cp"), xKey);
+        T.Venue memory v = annex.validateVenue(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey);
+        uint256 buyBase = annex.postPrice(v, true);
+        uint256 sellBase = annex.postPrice(v, false);
+        assertGt(buyBase, sellBase, "the window's extremes differ after a round trip");
+        // the SELL minimum, offered as a BUY bound, is below the BUY maximum: refused
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.Slippage.selector);
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, sellBase, vm.getBlockTimestamp());
+        // the BUY maximum, offered as a SELL floor, is above the SELL minimum: refused
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.Slippage.selector);
+        annex.post(_xNote(T.Side.Sell, 8_000, 1, "t"), xKey, 1 ether, 1, buyBase, vm.getBlockTimestamp());
+        vm.prank(alice);
+        annex.post(_xNote(T.Side.Buy, 12_000, 1, "t"), xKey, 1 ether, 1, buyBase, vm.getBlockTimestamp());
+        vm.prank(alice);
+        annex.post(_xNote(T.Side.Sell, 8_000, 1, "t"), xKey, 1 ether, 1, sellBase, vm.getBlockTimestamp());
+        assertEq(annex.noteCount(), 2);
     }
 
     /// @dev The 25:10 split is exact arithmetic on one swap's output, the Annex keeps no MARG, and the burn
@@ -608,12 +695,110 @@ contract AnnexAdversarialTest is Fixture {
         assertTrue(annex.noteOf(id).status == T.Status.Wrong);
     }
 
+    // ------------------------------------------------------------------ priceless readings (baf2967b)
+
+    /// @dev On a venue whose LP pulled every position, a reading has no price. Its place in the replacement
+    /// order: a hold breach still outranks it, it outranks any price, and once it is the last slot no price
+    /// (however adverse) replaces it. The sold-out case (price past a concentrated range, liquidity zero
+    /// without a pull) is reported separately: it settles a right call WRONG and is not asserted here.
+    function testPricelessReadingsRankBelowABreachAndAboveAnyPrice() public {
+        bytes32 buy = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up"), 1 ether);
+        bytes32 sell = _post(bob, _xNote(T.Side.Sell, 8_000, 1, "down"), 1 ether);
+        _pumpX(1_500_000 ether); // +32%: right for the BUY call, adverse for the SELL call
+        vm.warp(annex.horizonEnd(buy));
+        annex.observe(buy);
+        annex.observe(sell);
+        uint256 priced = annex.observationsOf(buy)[0].xRead;
+        assertGt(priced, 0);
+        // the LP pulls everything in the same block: a priceless reading replaces a priced one on both sides
+        liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
+        assertEq(manager.getLiquidity(xKey.toId()), 0);
+        annex.observe(buy);
+        annex.observe(sell);
+        assertEq(annex.observationsOf(buy).length, 1, "replaced, not appended");
+        assertEq(annex.observationsOf(buy)[0].xRead, 0);
+        assertEq(annex.observationsOf(buy)[0].balance, 1_000 ether, "the hold rule still reads");
+        assertEq(annex.observationsOf(sell)[0].xRead, 0);
+        // liquidity back and the price pushed hard against each side: a price never replaces no price
+        liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
+        _dumpX(bob, 1_000_000 ether); // far below par: the most adverse price a BUY call can see
+        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
+        annex.observe(buy);
+        _pumpX(3_000_000 ether); // far above: the most adverse a SELL call can see
+        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
+        annex.observe(sell);
+        // a hold breach still outranks it
+        _dumpX(alice, 1 ether);
+        annex.observe(buy);
+        assertEq(annex.observationsOf(buy).length, 1);
+        assertLt(annex.observationsOf(buy)[0].balance, 1_000 ether);
+        assertGt(annex.observationsOf(buy)[0].xRead, 0, "the breach reading carries the live price");
+        // and the breach is never replaced by a priceless, held reading
+        x.transfer(alice, 1 ether);
+        liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
+        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector);
+        annex.observe(buy);
+        liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
+    }
+
+    /// @dev Priceless readings are readings: two of them are still fewer than three, so an LP pull that nobody
+    /// bothers to observe three times stays VoidNoData (the bond returns), and a series of three that spans
+    /// under an hour too.
+    function testFewerThanThreePricelessReadingsAreStillNoData() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up"), 2 ether);
+        vm.warp(annex.horizonEnd(id));
+        liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
+        annex.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 2 hours);
+        annex.observe(id);
+        assertEq(annex.observationsOf(id).length, 2);
+        vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
+        uint256 poolsBefore = _hookPools();
+        vm.prank(bob);
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.VoidNoData, "two readings prove nothing");
+        assertEq(_hookPools(), poolsBefore, "nothing forfeited");
+        vm.prank(alice);
+        annex.claimDeposit(id);
+        assertEq(imd.balanceOf(address(annex)), 0);
+        liquidity.add(xKey, -6000, 6000, 10_000_000 ether);
+    }
+
+    /// @dev The case the rule was written for: a call that is already wrong on two standing prices cannot be
+    /// turned into a refund by the LP pulling the pool for the third reading; and a SELL author who pulls the
+    /// pool (no hold rule) gains nothing either.
+    function testAnLpPullCannotTurnAWrongCallIntoARefund() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up"), 4 ether);
+        vm.warp(annex.horizonEnd(id));
+        annex.observe(id); // at par: wrong
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        annex.observe(id); // still at par
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 31 minutes);
+        liquidity.add(xKey, -6000, 6000, -10_000_000 ether); // the pull
+        annex.observe(id);
+        liquidity.add(xKey, -6000, 6000, 10_000_000 ether); // and the refill, after the reading
+        vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
+        uint256 poolsBefore = _hookPools();
+        uint256 bobBefore = imd.balanceOf(bob);
+        vm.prank(bob);
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.Wrong);
+        assertEq(imd.balanceOf(bob) - bobBefore, 0.4 ether);
+        assertEq(_hookPools() - poolsBefore, 3.6 ether);
+        assertEq(_arec(alice).wrong, 1);
+        assertEq(annex.noteOf(id).deposit, 0);
+    }
+
     function testLifecycleRefusalsOnUnknownClosedAndForeignNotes() public {
         // a hook note id is not an annex note
         (bytes32 hookId,) = _note(alice, _margNote(T.Side.Buy, 12_000, 3, "on the hook"), 1 ether);
         vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
         annex.observe(hookId);
-        assertEq(annex.noteOf(hookId).author, address(0));
+        vm.expectRevert(MarginaliaAnnex.NotOpen.selector); // a hook id is unknown here (7842833a)
+        annex.noteOf(hookId);
         bytes32 none = keccak256("nowhere");
         vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
         annex.horizonEnd(none);
@@ -625,8 +810,14 @@ contract AnnexAdversarialTest is Fixture {
         annex.retract(none, "x");
         vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
         annex.claimDeposit(none);
-        assertEq(annex.noteOf(none).author, address(0));
+        vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
+        annex.noteOf(none);
+        vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
+        annex.noteOf(bytes32(0));
+        vm.expectRevert(MarginaliaAnnex.NotOpen.selector);
+        annex.noteOf(keccak256(abi.encode(address(annex), uint256(1)))); // the next id, not yet issued
         assertEq(annex.observationsOf(none).length, 0);
+        assertTrue(annex.venueOf(none).kind == T.VenueKind.None);
 
         bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "t"), 1 ether);
         vm.prank(alice);
@@ -691,7 +882,7 @@ contract AnnexAdversarialTest is Fixture {
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.roll(vm.getBlockNumber() + 300);
         vm.prank(alice);
-        bytes32 id2 = annex.post(p, k, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        bytes32 id2 = annex.post(p, k, 1 ether, 1, 0, vm.getBlockTimestamp() + 1);
         blk.setBlocked(alice, true);
         plain.swap(k, !is0, 1_500_000 ether, bob); // price is right...
         _observeAll(id2);
