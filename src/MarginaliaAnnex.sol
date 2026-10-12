@@ -74,6 +74,13 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     uint16 public constant QUORUM = 4;
     address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    /// @dev The pricer's ETH/IMD hub pool (`MarginaliaPricer.HUB_POOL_ID`), the ETH -> IMD leg.
+    bytes32 private constant HUB_POOL_ID = 0xb07d640fd9e2eb9dc81b953c8e4fd006bdfeaf276010fb5418eb763ca15abfb3;
+    /// @dev The sqrt prices the pricer's `fromSqrt` can express in both orientations: 1e20 prices token0 at
+    /// 1e-18 of token1 (1 wei per 1e18), 7e37 at ~7.8e17 (its inverse rounds to 1 wei). A standing price on
+    /// a pool with no liquidity in range is clamped to them before it is read.
+    uint160 private constant SQRT_FLOOR = 1e20;
+    uint160 private constant SQRT_CEIL = 7e37;
     /// @dev A hook holding any of these permissions can act on a swap; one holding none of them cannot.
     uint160 public constant SWAP_FLAGS = HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP
         | HookFlags.BEFORE_SWAP_RETURN_DELTA | HookFlags.AFTER_SWAP_RETURN_DELTA;
@@ -178,8 +185,8 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     /// `fee` is the dynamic flag the hook sets the LP fee with no permission bit, so only the Marginalia hook or
     /// an admitted one passes there. This is the predicate `validateVenue` applies.
     function hookAllowedFor(address hooks, uint24 fee) public view returns (bool) {
-        if (!hookAllowed(hooks)) return false;
-        return fee != LPFeeLibrary.DYNAMIC_FEE_FLAG || hooks == address(hook) || admittedHook[hooks];
+        if (hooks == address(hook) || admittedHook[hooks]) return true;
+        return fee != LPFeeLibrary.DYNAMIC_FEE_FLAG && (hooks == address(0) || !hookCanTouchSwaps(hooks));
     }
 
     /// @notice The venue check: a live v4 pool, allowed hook, X on one side, IMD / WETH / ETH on the other.
@@ -189,7 +196,7 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     function validateVenue(T.NoteParams memory p, PoolKey memory key) public view returns (T.Venue memory v) {
         v = p.venue;
         address imd = hook.imd();
-        if (p.x == address(0) || p.x == imd || p.x.code.length == 0) revert InvalidNote();
+        if (p.x == imd || p.x.code.length == 0) revert InvalidNote(); // address(0) has no code
         if (v.kind != T.VenueKind.UniV4 || PoolId.unwrap(key.toId()) != v.ref) revert BadVenue();
         if (!hookAllowedFor(address(key.hooks), key.fee)) revert BadVenue();
         if (hook.poolManager().getLiquidity(PoolId.wrap(v.ref)) == 0) revert BadVenue();
@@ -277,8 +284,7 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         n.postBalance = _balanceOf(p.x, author);
         // a BUY call whose balance cannot be read could only settle VoidSold: refused at post, as on the hook
         if (p.side == T.Side.Buy && n.postBalance == type(uint256).max) revert InvalidNote();
-        n.postPrice = postPrice(v, p.side == T.Side.Buy);
-        if (n.postPrice == 0) revert InvalidNote();
+        n.postPrice = postPrice(v, p.side == T.Side.Buy); // the pricer refuses a zero baseline (EmptyPool)
         if (
             baselineBound != 0
                 && (p.side == T.Side.Buy ? n.postPrice > baselineBound : n.postPrice < baselineBound)
@@ -317,9 +323,9 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
 
     /// @notice Anyone records a reading in the settlement window. Refused while the PoolManager is unlocked,
     /// so a reading cannot be taken between two swaps of one transaction (dump, observe, rebuy): a price has
-    /// to be left standing for the next transaction to be read. A venue whose in-range liquidity has been
-    /// pulled since the post has no price; that is recorded as a reading too (`xRead == 0`), adverse to the
-    /// call, so emptying the pool for the window cannot turn a forfeit into a refund.
+    /// to be left standing for the next transaction to be read. A venue with no liquidity in range (the price
+    /// ran past its last position, or every position was pulled) is read at its standing price (`_spot`), so
+    /// emptying the pool for the window cannot turn a forfeit into a refund.
     function observe(bytes32 id) external {
         T.Note storage n = _note(id);
         if (n.status != T.Status.Open) revert NotOpen();
@@ -327,12 +333,7 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         if (block.timestamp < end) revert TooEarly();
         if (block.timestamp > end + SETTLE_WINDOW) revert TooLate();
         T.Observation[] storage obs = observations[id];
-        IPoolManager manager = _lockedManager();
-        uint256 xRead;
-        uint256 quoteRead;
-        if (manager.getLiquidity(PoolId.wrap(n.venue.ref)) != 0) {
-            (xRead, quoteRead) = pricer().observe(manager, n.venue, hook.imd());
-        }
+        (uint256 xRead, uint256 quoteRead) = _spot(_lockedManager(), n.venue);
         uint256 balance = _balanceOf(n.x, n.author);
         T.Observation memory o =
             T.Observation(uint64(block.timestamp), uint64(block.number), xRead, quoteRead, balance);
@@ -365,18 +366,14 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
             outcome = T.Status.VoidNoData;
         } else {
             bool held = true;
-            bool emptied; // a reading with no in-range liquidity: no price, adverse to either side
             for (uint256 i = 0; i < count; ++i) {
                 if (_broken(n, obs[i].balance)) held = false;
-                if (obs[i].xRead == 0) emptied = true;
             }
-            if (!emptied) settlePrice = _settlementPrice(n, obs);
-            if (settlePrice == 0 && !emptied) {
+            settlePrice = _settlementPrice(n, obs);
+            if (settlePrice == 0) {
                 outcome = T.Status.VoidNoData;
             } else if (!held) {
                 outcome = T.Status.VoidSold;
-            } else if (emptied) {
-                outcome = T.Status.Wrong;
             } else if (n.side == T.Side.Buy) {
                 outcome = settlePrice * 10_000 >= n.postPrice * n.targetBps ? T.Status.Right : T.Status.Wrong;
             } else {
@@ -470,8 +467,6 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         bool brokenLast = _broken(n, last.balance);
         if (brokenLast && !brokenNew) return false;
         if (brokenNew && !brokenLast) return true;
-        if (last.xRead == 0) return false; // nothing is more adverse than no price
-        if (o.xRead == 0) return true;
         uint256 pn = FullMath.mulDiv(o.xRead, o.quoteRead, 1e18);
         uint256 pl = FullMath.mulDiv(last.xRead, last.quoteRead, 1e18);
         return n.side == T.Side.Buy ? pn < pl : pn > pl;
@@ -483,16 +478,20 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     }
 
     function _balanceOf(address x, address who) private view returns (uint256) {
-        (bool ok, bytes memory ret) =
-            x.staticcall{gas: BALANCE_READ_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, who));
-        if (!ok || ret.length < 32) return type(uint256).max;
-        return abi.decode(ret, (uint256));
+        (bool ok, uint256 balance) = _read(x, abi.encodeWithSelector(IERC20.balanceOf.selector, who));
+        return ok ? balance : type(uint256).max;
+    }
+
+    /// @dev A bounded token read; `ok` is false on a revert, a short return or the gas cap.
+    function _read(address x, bytes memory data) private view returns (bool ok, uint256 value) {
+        bytes memory ret;
+        (ok, ret) = x.staticcall{gas: BALANCE_READ_GAS}(data);
+        if (!ok || ret.length < 32) return (false, 0);
+        value = abi.decode(ret, (uint256));
     }
 
     function _difficulty(T.Note storage n) private view returns (uint256) {
-        (bool ok, bytes memory ret) =
-            n.x.staticcall{gas: BALANCE_READ_GAS}(abi.encodeWithSelector(IERC20.totalSupply.selector));
-        uint256 supply = ok && ret.length >= 32 ? abi.decode(ret, (uint256)) : 0;
+        (, uint256 supply) = _read(n.x, abi.encodeWithSelector(IERC20.totalSupply.selector));
         uint256 mcap = supply <= type(uint256).max / n.postPrice ? n.postPrice * supply / 1e18 : 0;
         return pricer().difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
     }
@@ -500,6 +499,30 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     function _note(bytes32 id) private view returns (T.Note storage n) {
         n = notes[id];
         if (n.author == address(0)) revert NotOpen();
+    }
+
+    /// @dev What one observation reads. With liquidity in range it is the pricer's reading. Without any (v4's
+    /// `getLiquidity` is the liquidity at the current tick: zero past the last tick of a concentrated range as
+    /// much as on a pulled pool) the standing `slot0` price is priced alone, so a call the pool sold out past
+    /// settles on the price it sold out at, and a pulled pool keeps its last price. A swap costs nothing past
+    /// the last initialised tick, so a standing price beyond it can be pushed to an extreme the pricer cannot
+    /// express (below 1e-18 of the quote, or its inverse); it is clamped to the pricer's range first, so the
+    /// reading is the extreme itself, adverse to one side and not to the other, and never a missing reading.
+    function _spot(IPoolManager manager, T.Venue memory v)
+        private
+        view
+        returns (uint256 xRead, uint256 quoteRead)
+    {
+        address imd = hook.imd();
+        PoolId pid = PoolId.wrap(v.ref);
+        if (manager.getLiquidity(pid) != 0) return pricer().observe(manager, v, imd);
+        (uint160 sqrtP,,,) = manager.getSlot0(pid);
+        if (sqrtP < SQRT_FLOOR) sqrtP = SQRT_FLOOR;
+        else if (sqrtP > SQRT_CEIL) sqrtP = SQRT_CEIL;
+        xRead = pricer().fromSqrt(sqrtP, v.xIsToken0);
+        if (v.quote == imd) return (xRead, 1e18);
+        (sqrtP,,,) = manager.getSlot0(PoolId.wrap(HUB_POOL_ID)); // ETH / WETH: the hub's spot, ETH is token0
+        quoteRead = pricer().fromSqrt(sqrtP, true);
     }
 
     /// @dev The hook's PoolManager, required to be locked: no price is read from inside anyone's unlock.
@@ -563,11 +586,7 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
                 chain,
                 bytes(',"window":{"hours":24},"answerType":"address[]","evidence":"panel","head":'),
                 bytes(Strings.toString(hooks.length)),
-                bytes(',"panelSize":'),
-                bytes(Strings.toString(PANEL_SIZE)),
-                bytes(',"quorum":'),
-                bytes(Strings.toString(QUORUM)),
-                bytes(',"validForSeconds":86400,"guards":{"allow":['),
+                bytes(',"panelSize":5,"quorum":4,"validForSeconds":86400,"guards":{"allow":['), // PANEL_SIZE, QUORUM
                 list,
                 bytes('],"mustHaveCode":true},"consumer":{"chainId":'),
                 chain,
@@ -633,10 +652,9 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     // ------------------------------------------------------------------ the MARG purchase
 
     /// @dev One quiet buy of `imdIn` IMD on the launch pool: the `authorIn` share of the MARG goes to `to`,
-    /// the rest is burned. Returns the author's share.
-    function _buyMarg(uint256 imdIn, uint256 authorIn, uint256 minOut, address to) private returns (uint256) {
-        bytes memory ret = hook.poolManager().unlock(abi.encode(imdIn, authorIn, minOut, to));
-        return abi.decode(ret, (uint256));
+    /// the rest is burned. The callback returns the author's share.
+    function _buyMarg(uint256 imdIn, uint256 authorIn, uint256 minOut, address to) private {
+        hook.poolManager().unlock(abi.encode(imdIn, authorIn, minOut, to));
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {

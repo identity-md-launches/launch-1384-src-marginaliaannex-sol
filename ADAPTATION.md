@@ -1,3 +1,61 @@
+# Annex revision after the second independent review — 2026-10-12
+
+This is a revision of the accepted Annex launch, not a rewrite. The only production source changed is
+`src/MarginaliaAnnex.sol`; the constructor, its four arguments, the launch shape (nonpayable, no external call, no
+owner / pause / upgrade / proxy / DELEGATECALL / CALLCODE / SELFDESTRUCT), every number in the brief and the Intake
+callback's write-set are as they were. `.imd-responses.json` answers each reported item. The reopened finding was
+reproduced first with the reviewer's scenario as a test against the unchanged code (it failed exactly as described:
+status `Wrong`, 1 IMD to the settler, `claimDeposit` reverting), then fixed; the test is kept in `test/Annex.t.sol`.
+
+## Reopened finding: reproduced and changed
+
+| Finding | Reproduced | Change in `src/MarginaliaAnnex.sol` | Test |
+| --- | --- | --- | --- |
+| `8c23b075` (high): `observe` recorded a priceless reading whenever `manager.getLiquidity(poolId) == 0`, and `settle` booked any priceless reading as `Wrong`. v4's `getLiquidity` is the liquidity at the current tick, zero past the last tick of a concentrated range with every position in place, so a right BUY call on a single-range pool that sold out above its target was forfeited (10% to the settler), and a stranger could plant the reading by buying the range out for one standing block. | Yes: alice's BUY +20%, 10 IMD bond; bob's 4,000,000 IMD swap crossed tick 6000 (`getLiquidity == 0`, slot0 above 1.2 IMD, positions in place, alice holding); three readings all `xRead == 0`; `settle` gave `Wrong`, carol received 1 IMD, 9 IMD went to `hook.fundPot`, `claimDeposit` reverted `NothingToClaim`. | The priceless reading is gone. A new private `_spot` reads every observation: with liquidity in range it is the pricer's reading as before; without any, the standing `slot0` price is priced alone through the pricer's own `fromSqrt` (the quote leg stays 1 for IMD and the hub pool's spot for ETH / WETH, read the same way), so a call the pool sold out past settles on the price it sold out at and a pulled pool keeps its last price. The LP-pull closure of `baf2967b` is kept: an emptied venue is read, never void. Because a swap costs nothing past the last initialised tick, the standing price can sit at an extreme the pricer cannot express (below 1e-18 of the quote, or its inverse, where `fromSqrt` reverts); `_spot` clamps the sqrt price to `[1e20, 7e37]` first, so the reading is the extreme itself (1 wei per 1e18 X, or ~7.8e35), adverse to one side and favourable to the other, and never a missing reading or a revert. `settle`'s `emptied` branch and `_moreAdverse`'s `xRead == 0` ranks are removed with it (dead once no reading is priceless). | `testSoldOutRangeStillSettlesRight` (the reviewer's scenario: three readings, `Right`, the settler unchanged, `records.right == 1`, the bond back; plus a free push further out only lifts the reading and a free push back stops at the range's edge, the last real price), `testAPulledPoolPushedToAnExtremeIsReadAtTheExtreme` (a pool with no position: X dear reads above 1e30, X worthless reads 1 wei; a keeper's push back decides both a BUY and a SELL call `Wrong`), `testEmptiedVenueForfeitsInsteadOfRefunding` updated (a pulled pool is read at its standing 1e18, `Wrong`, 10% / 90% split, a same-price replacement refused), `testEmptiedVenueOnASoldBuyCallIsStillVoidSold` unchanged. |
+
+Residual, stated plainly: on a pool with **no position at all** the standing price can be moved anywhere for nothing,
+so its readings are whatever the last swap left standing and the most adverse of the window decides, as everywhere
+else (a keeper's reading beats an author's; without a keeper every call is already `VoidNoData`). Past a range's edge
+the free movement is one-way (away from the range); back to the edge is free, below it every wei has to be traded,
+so the adverse reading on a sold-out pool is bounded by the range's edge, the last real price. `AGENTS.md` says so
+and tells agents not to post on a venue whose whole liquidity one party can pull. The hub leg on a liquidity-less
+venue reads the hub's `slot0` without the pricer's hub-liquidity check (a sold-out hub would otherwise void the
+window); the mainnet hub is a hookless pool with many positions.
+
+## Bytes
+
+The fix added code to a contract 75 bytes under EIP-170, so equivalent, behaviour-preserving reductions were made in
+the same file: `_balanceOf` and `_difficulty` share one bounded `_read` helper; `admissionBody` writes
+`"panelSize":5,"quorum":4` as a literal (the constants are unchanged and the body is byte-identical:
+`testAdmissionBodyIsStrictJson` still parses it and checks both numbers); `hookAllowedFor` is the same predicate
+written without the double test; two dead checks are gone (`p.x == address(0)` is implied by `code.length == 0`,
+`n.postPrice == 0` cannot pass the pricer, which reverts `EmptyPool` on a zero baseline); `_buyMarg` no longer
+decodes a return value nothing used. Runtime is now **24,493 bytes** (83 bytes of headroom), initcode 25,988.
+
+## Advisory finding
+
+| Finding | Verdict | What was done |
+| --- | --- | --- |
+| `30d57a4c` (info): on the MARG venue a BUY call bounded at the exactly quoted `postPrice` reverts `Slippage`, because the post's own 0.35 IMD purchase lands before the baseline is read. | Reproduces: quoted 1.000000e18, a bound at it reverts, a bound 1% above posts and records 1.000000069125001194e18. **Documentation**, as the reviewer asked; the order (purchase, then baseline) is what closes the double-counted post balance on the MARG venue and is not changed. | `AGENTS.md` now says the MARG venue is the one where the quoted price itself is refused and to leave the few percent of room on every venue. `testMargVenueBaselineBoundNeedsRoomForThePostsOwnPurchase` pins the note. |
+
+## Validation (this revision)
+
+- `forge build`: passes. `MarginaliaAnnex` runtime **24,493 bytes** (EIP-170 limit 24,576), initcode 25,988.
+- `forge test --match-path test/Annex.t.sol`: **29 passed, 0 failed** (the 26 as accepted, one updated, plus 3 new).
+- `forge test --no-match-path 'test/{scratch,fork}/*'`: **291 passed, 0 failed** across 22 suites before the last
+  test was added; the Annex suite was rerun after it.
+- The supplied `Contracts.protected.t.sol` was copied unchanged to `test/scratch/` and run against the new creation
+  code with the four constructor arguments, a probe factory, chain id 1 and a CREATE2 salt whose address was
+  predicted off-line: **1 passed** (constructor runs in the empty EVM, runtime present, under EIP-170, no
+  DELEGATECALL / CALLCODE / SELFDESTRUCT). The copy is gone with scratch.
+- `testFullListFitsTheCallbackStipend`: the Intake callback at the full 4-hook list measured **167,188 gas** under
+  the 200k stipend; the callback was not touched.
+- Not run: `test/fork/MainnetLaunch.t.sol` (no `MAINNET_RPC_URL`); no Slither, Mythril, broadcast or explorer
+  verification is claimed. No dependency, build configuration, submodule, `.git`, `.github`, environment file or
+  `node_modules` path changed.
+
+---
+
 # Annex revision after the independent review — 2026-10-12
 
 This is a revision of the accepted Annex launch, not a rewrite. The only production source changed is

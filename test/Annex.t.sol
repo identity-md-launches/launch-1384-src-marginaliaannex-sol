@@ -89,6 +89,31 @@ contract FlashReader is IUnlockCallback {
     }
 }
 
+/// @dev Moves a pool's standing price to a sqrt limit with a 1-wei exact-input swap. On a pool with no liquidity
+/// in range the price travels to the next initialised tick (or the limit) for nothing: no amount is owed.
+contract FreeSwapper is IUnlockCallback {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
+    IPoolManager immutable manager;
+
+    constructor(IPoolManager m) {
+        manager = m;
+    }
+
+    function push(PoolKey memory key, uint160 limit) external {
+        manager.unlock(abi.encode(key, limit));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        (PoolKey memory key, uint160 limit) = abi.decode(data, (PoolKey, uint160));
+        (uint160 sqrtP,,,) = manager.getSlot0(key.toId());
+        BalanceDelta d = manager.swap(key, SwapParams(limit < sqrtP, -1, limit), "");
+        require(d.amount0() == 0 && d.amount1() == 0, "not free");
+        return "";
+    }
+}
+
 /// @dev Stands in for the Intake: takes the price, records the body, and delivers an attestation back to the
 /// consumer under the protocol's 200k callback stipend, reporting whether the callback succeeded.
 contract AdmitIntake is IIntake {
@@ -806,9 +831,9 @@ contract AnnexTest is Fixture {
     }
 
     /// @dev baf2967b (medium): pulling the venue's in-range liquidity for the window used to make every
-    /// observation revert, so a WRONG call settled VoidNoData and the bond came back. A reading on an emptied
-    /// venue is recorded with no price and is adverse to either side; fewer than three readings for want of an
-    /// observer still refund.
+    /// observation revert, so a WRONG call settled VoidNoData and the bond came back. A pulled pool keeps its
+    /// standing price and is read at it (8c23b075 replaced the earlier priceless reading, which also hit a
+    /// right call the pool had sold out past); fewer than three readings for want of an observer still refund.
     function testEmptiedVenueForfeitsInsteadOfRefunding() public {
         bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up 20%"), 10 ether);
         bytes32 sellId = _post(bob, _xNote(T.Side.Sell, 8_000, 1, "down 20%"), 1 ether);
@@ -819,7 +844,8 @@ contract AnnexTest is Fixture {
         annex.observe(sellId);
         T.Observation[] memory obs = annex.observationsOf(id);
         assertEq(obs.length, 1);
-        assertEq(obs[0].xRead, 0, "no price");
+        assertEq(obs[0].xRead, 1e18, "the standing price, where the last trade left it");
+        assertEq(obs[0].quoteRead, 1e18);
         assertEq(obs[0].balance, 1_000 ether, "the hold rule still reads");
         vm.roll(vm.getBlockNumber() + 25);
         vm.warp(vm.getBlockTimestamp() + 30 minutes);
@@ -830,7 +856,7 @@ contract AnnexTest is Fixture {
         annex.observe(id);
         annex.observe(sellId);
         vm.roll(vm.getBlockNumber() + 5); // too soon for a new slot: a replacement must be more adverse
-        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector); // nothing is more adverse than no price
+        vm.expectRevert(MarginaliaAnnex.ObservationTooSoon.selector); // the same price is not
         annex.observe(id);
         vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
         liquidity.add(xKey, -6000, 6000, 10_000_000 ether); // and puts it back
@@ -838,7 +864,7 @@ contract AnnexTest is Fixture {
         uint256 carolBefore = imd.balanceOf(carol);
         vm.prank(carol);
         annex.settle(id);
-        assertTrue(annex.noteOf(id).status == T.Status.Wrong, "an emptied venue is adverse, not void");
+        assertTrue(annex.noteOf(id).status == T.Status.Wrong, "an emptied venue is read, not void");
         assertEq(imd.balanceOf(carol) - carolBefore, 1 ether, "10% to the settler");
         assertEq(_pools() - poolsBefore, 9 ether, "the rest to the pools");
         assertEq(_arec(alice).wrong, 1);
@@ -847,7 +873,93 @@ contract AnnexTest is Fixture {
         annex.claimDeposit(id);
         vm.prank(carol);
         annex.settle(sellId);
-        assertTrue(annex.noteOf(sellId).status == T.Status.Wrong, "adverse to a SELL call too");
+        assertTrue(annex.noteOf(sellId).status == T.Status.Wrong, "wrong on the standing price too");
+        assertEq(imd.balanceOf(address(annex)), 0);
+    }
+
+    /// @dev 8c23b075 (high): v4's `getLiquidity` is the liquidity at the current tick, zero once the price has
+    /// run past the last tick of a concentrated range with every position still in place. A right BUY call on a
+    /// single-range pool that sold out above its target was read as priceless and settled WRONG, paying the
+    /// settler; a stranger could plant the same reading by buying the range out for one standing block. The
+    /// standing price is read instead: the pool sold out above the target, so the call is RIGHT.
+    function testSoldOutRangeStillSettlesRight() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up 20%"), 10 ether);
+        assertEq(annex.noteOf(id).postPrice, 1e18);
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.warp(vm.getBlockTimestamp() + 12);
+        _pumpX(4_000_000 ether); // bob buys the whole range out: the price crosses tick 6000
+        assertEq(manager.getLiquidity(xKey.toId()), 0, "past the last initialised tick, positions in place");
+        (uint160 sqrtP,,,) = manager.getSlot0(xKey.toId());
+        uint256 standing = annex.pricer().fromSqrt(sqrtP, xIs0);
+        assertGt(standing, 1.2e18, "the standing price is above the target");
+        assertEq(x.balanceOf(alice), 1_000 ether);
+        vm.warp(annex.horizonEnd(id));
+        annex.observe(id);
+        // bob's swap ran to its price limit for nothing once the range was out: the standing price is the
+        // extreme, which the pricer cannot express; it is read as the clamped extreme, not as a missing reading
+        assertGt(annex.observationsOf(id)[0].xRead, 1e30, "the extreme is a price, not a missing reading");
+        // a free push back down stops at the range's edge: below it every wei of X has to be bought
+        FreeSwapper f = new FreeSwapper(manager);
+        uint160 edgeSqrt = TickMath.getSqrtPriceAtTick(xIs0 ? int24(6000) : int24(-6000));
+        f.push(xKey, edgeSqrt);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        annex.observe(id);
+        uint256 edge = annex.pricer().fromSqrt(edgeSqrt, xIs0);
+        assertEq(annex.observationsOf(id)[1].xRead, edge, "the range's edge, the last real price");
+        assertGt(edge, 1.2e18);
+        // and a free push the other way (nothing is for sale above the range) only lifts the reading
+        f.push(xKey, xIs0 ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 31 minutes);
+        annex.observe(id);
+        assertGt(annex.observationsOf(id)[2].xRead, edge);
+        vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
+        uint256 carolBefore = imd.balanceOf(carol);
+        vm.prank(carol);
+        annex.settle(id);
+        assertTrue(annex.noteOf(id).status == T.Status.Right, "a right call on a sold-out range");
+        assertEq(imd.balanceOf(carol), carolBefore, "a right call pays the settler nothing");
+        assertEq(_arec(alice).right, 1);
+        vm.prank(alice);
+        annex.claimDeposit(id);
+        assertEq(imd.balanceOf(address(annex)), 0, "the bond came back");
+    }
+
+    /// @dev On a pool with no position left at all a swap moves the standing price anywhere for nothing. The
+    /// extremes the pricer cannot express are clamped, so a reading is always recorded (worthless or dear,
+    /// adverse to one side only) and the most adverse of the window decides, as everywhere else: a keeper's
+    /// reading beats the author's.
+    function testAPulledPoolPushedToAnExtremeIsReadAtTheExtreme() public {
+        bytes32 id = _post(alice, _xNote(T.Side.Buy, 12_000, 1, "up 20%"), 1 ether);
+        bytes32 sellId = _post(bob, _xNote(T.Side.Sell, 8_000, 1, "down 20%"), 1 ether);
+        vm.warp(annex.horizonEnd(id));
+        liquidity.add(xKey, -6000, 6000, -10_000_000 ether);
+        FreeSwapper f = new FreeSwapper(manager);
+        // the author of each call pushes the price its way for free and reads it
+        f.push(xKey, xIs0 ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1); // X dear
+        annex.observe(id);
+        assertGt(annex.observationsOf(id)[0].xRead, 1e30, "X dear: the clamped extreme, not zero");
+        f.push(xKey, xIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1); // X worthless
+        annex.observe(sellId);
+        assertEq(annex.observationsOf(sellId)[0].xRead, 1, "X worthless: one wei per 1e18 X");
+        // a keeper pushes it back the other way and reads it: adverse to both, and it decides
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        annex.observe(id); // still worthless from the last push
+        f.push(xKey, xIs0 ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1);
+        annex.observe(sellId);
+        vm.roll(vm.getBlockNumber() + 25);
+        vm.warp(vm.getBlockTimestamp() + 31 minutes);
+        annex.observe(id);
+        annex.observe(sellId);
+        vm.warp(annex.horizonEnd(id) + annex.SETTLE_WINDOW() + 1);
+        vm.prank(carol);
+        annex.settle(id);
+        vm.prank(carol);
+        annex.settle(sellId);
+        assertTrue(annex.noteOf(id).status == T.Status.Wrong, "the worthless reading decides the BUY call");
+        assertTrue(annex.noteOf(sellId).status == T.Status.Wrong, "the dear reading decides the SELL call");
         assertEq(imd.balanceOf(address(annex)), 0);
     }
 
@@ -912,6 +1024,23 @@ contract AnnexTest is Fixture {
             _xNote(T.Side.Sell, 8_000, 1, "down"), xKey, 1 ether, 1, 0.5e18, vm.getBlockTimestamp() + 1
         );
         assertEq(annex.noteCount(), 2);
+    }
+
+    /// @dev 30d57a4c (info): on the MARG venue the post's own 0.35 IMD purchase lands before the baseline is
+    /// read, so a BUY bound at exactly the quoted `postPrice` reverts Slippage there; a few percent of room
+    /// posts. Documented in AGENTS.md; pinned here so the note stays true.
+    function testMargVenueBaselineBoundNeedsRoomForThePostsOwnPurchase() public {
+        T.NoteParams memory p = _margNote(T.Side.Buy, 12_000, 1, "up 20%");
+        uint256 quoted = annex.postPrice(annex.validateVenue(p, key), true);
+        assertEq(quoted, 1e18);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.Slippage.selector);
+        annex.post(p, key, 1 ether, 0, quoted, vm.getBlockTimestamp() + 1);
+        vm.prank(alice);
+        bytes32 id = annex.post(p, key, 1 ether, 0, quoted * 101 / 100, vm.getBlockTimestamp() + 1);
+        uint256 recorded = annex.noteOf(id).postPrice;
+        assertGt(recorded, quoted, "the purchase moved the spot the baseline folds in");
+        assertLt(recorded, quoted * 101 / 100);
     }
 
     /// @dev 7842833a (info): an id this contract never issued reverts, as the hook's noteOf does.
