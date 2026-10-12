@@ -1,0 +1,15 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "MarginaliaAnnex",
+      "constructorArgs": [
+        "0xf0457dd0cf526686190e4f057ba19db14d34a0cc",
+        "0x1397434cd35e8a9C8aC312A61D3A285EB31dea56",
+        "0x6f7261636c652e72657175657374406f7261636c652d31000000000000000000",
+        "0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982"
+      ]
+    }
+  ],
+  "notes": "MarginaliaAnnex (src/MarginaliaAnnex.sol): Marginalia calls on the Uniswap v4 pools the hook's immutable router refuses, chiefly every IMD custom_token launch pool behind the factory's PoolInitializationGuard hook 0x784ff9a3ac5d88a30bfff6f7f2a270161fbe6000. Constructor (hook, intake, action, signer): hook = 0xf0457dd0cf526686190e4f057ba19db14d34a0cc, the live MarginaliaHook of launch 1283; intake = 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56, the IdentityMD Intake; action = bytes32('oracle.request@oracle-1'), the oracle action; signer = 0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982, the IdentityMD oracle signer. These are the same constants the live hook holds as INTAKE, ACTION and ORACLE_SIGNER. The constructor reads no chain state; it stores the four values (the signer through OracleAttestationConsumer, EIP-712 domain IdentityMD Oracle v2). No owner, no pause, no upgrade: there is no owner argument and $owner is not used. Venue rule: a live v4 pool with X on one side and IMD / WETH / native ETH on the other whose hook is none or the Marginalia hook, has no swap permission bits (dynamic-fee pools, fee 0x800000, pass only with the Marginalia hook or an admitted hook), or was admitted permanently by the IdentityMD oracle panel through requestAdmission (1 to 4 hooks with code, paid at the Intake's price for oracle.request@oracle-1, at most 1 IMD; panelSize 5, quorum 4; callback onOracleResult accepts only the Intake and a valid attestation from the signer). Economics: post pulls 0.1 stamp + 0.25 MARG buy + bond (0.25 to 10 IMD); 0.35 IMD is swapped for MARG on the hook's MARG/IMD pool, the author receives the 0.25 share and the 0.10 share goes to 0x000000000000000000000000000000000000dEaD; the bond is held as IMD and returned on RIGHT or VOID_NODATA, forfeited to the hook's pools via hook.fundPot on WRONG / VOID_SOLD with 10% to the settler, and forfeited on retract. Prices come from the immutable MarginaliaPricer at 0xEaff9B262341A0cB05579227e662BFE768A71cfb. Runtime stays under EIP-170; tests: forge test --match-path test/Annex.t.sol."
+}
