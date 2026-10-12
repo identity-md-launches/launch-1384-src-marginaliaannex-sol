@@ -21,6 +21,23 @@ contract GuardHook {
     }
 }
 
+/// @dev An ERC-20 whose balanceOf reverts for a blocked holder (a blacklist), so the Annex's bounded read fails
+/// for that holder while transfers and the pool still work.
+contract BlockedReadToken is MockERC20 {
+    mapping(address => bool) public blocked;
+
+    constructor() MockERC20("Blocked", "BLK", 1_000_000_000 ether) {}
+
+    function setBlocked(address who, bool b) external {
+        blocked[who] = b;
+    }
+
+    function balanceOf(address who) public view override returns (uint256) {
+        require(!blocked[who], "blocked");
+        return super.balanceOf(who);
+    }
+}
+
 /// @dev Stands in for the Intake: takes the price, records the body, and delivers an attestation back to the
 /// consumer under the protocol's 200k callback stipend, reporting whether the callback succeeded.
 contract AdmitIntake is IIntake {
@@ -49,10 +66,12 @@ contract AdmitIntake is IIntake {
         requestId = keccak256(abi.encode(requests, body));
     }
 
-    function deliver(address target, bytes32 requestId, OracleAttestation.Attestation calldata a, bytes calldata sig)
-        external
-        returns (bool ok)
-    {
+    function deliver(
+        address target,
+        bytes32 requestId,
+        OracleAttestation.Attestation calldata a,
+        bytes calldata sig
+    ) external returns (bool ok) {
         (ok,) = target.call{gas: 200_000}(abi.encodeCall(MarginaliaAnnex.onOracleResult, (requestId, a, sig)));
     }
 }
@@ -201,7 +220,10 @@ contract AnnexTest is Fixture {
         assertGt(token.balanceOf(alice), margBefore, "the author receives the MARG bought with 0.25 IMD");
         assertGt(token.balanceOf(annex.DEAD()) - deadBefore, 0, "the stamp bought MARG and burned it");
         assertApproxEqRel(
-            token.balanceOf(alice) - margBefore, (token.balanceOf(annex.DEAD()) - deadBefore) * 5 / 2, 0.001e18, "25 : 10 split"
+            token.balanceOf(alice) - margBefore,
+            (token.balanceOf(annex.DEAD()) - deadBefore) * 5 / 2,
+            0.001e18,
+            "25 : 10 split"
         );
         assertEq(imd.balanceOf(address(annex)), 1 ether, "the annex holds exactly the bond");
         T.NoteView memory n = annex.noteOf(id);
@@ -231,7 +253,9 @@ contract AnnexTest is Fixture {
         vm.prank(address(agent));
         imd.approve(address(annex), type(uint256).max);
         vm.prank(address(agent));
-        bytes32 id = annex.post(_xNote(T.Side.Sell, 8_000, 1, "agent"), xKey, 0.25 ether, 1, vm.getBlockTimestamp() + 1);
+        bytes32 id = annex.post(
+            _xNote(T.Side.Sell, 8_000, 1, "agent"), xKey, 0.25 ether, 1, vm.getBlockTimestamp() + 1
+        );
         assertEq(annex.noteOf(id).class, uint8(T.Class.Agent));
     }
 
@@ -363,6 +387,70 @@ contract AnnexTest is Fixture {
         vm.expectRevert(MarginaliaAnnex.BadVenue.selector); // no liquidity: the gate itself let it through
         annex.validateVenue(p, ours);
         assertTrue(annex.hookAllowed(GUARD), "the static-fee guard pool is still a venue by bits");
+        // audit 71a5281f: the public predicate answers with the pool's fee, as validateVenue decides
+        assertTrue(annex.hookAllowedFor(GUARD, 3000));
+        assertFalse(annex.hookAllowedFor(GUARD, 0x800000), "dynamic fee: bits prove nothing");
+        assertFalse(
+            annex.hookAllowedFor(address(0), 0x800000), "a hookless pool cannot be dynamic-fee anyway"
+        );
+        assertTrue(annex.hookAllowedFor(address(hook), 0x800000));
+        assertFalse(annex.hookAllowedFor(TAXER, 3000));
+        assertFalse(annex.hookAllowedFor(TAXER, 0x800000));
+    }
+
+    function testAnAdmittedHookPassesTheDynamicFeeGate() public {
+        address[] memory asked = new address[](1);
+        asked[0] = TAXER;
+        vm.prank(carol);
+        bytes32 requestId = annex.requestAdmission(asked);
+        OracleAttestation.Attestation memory a = _att(requestId, asked);
+        assertTrue(intake.deliver(address(annex), requestId, a, _sign(a)));
+        assertTrue(annex.hookAllowedFor(TAXER, 0x800000), "admitted: the panel read the fee logic too");
+        PoolKey memory dyn = PoolKey(xKey.currency0, xKey.currency1, 0x800000, 60, IHooks(TAXER));
+        T.NoteParams memory p = _xNote(T.Side.Buy, 12_000, 1, "t");
+        p.venue.ref = PoolId.unwrap(dyn.toId());
+        vm.expectRevert(MarginaliaAnnex.BadVenue.selector); // the gate let it through; no liquidity
+        annex.validateVenue(p, dyn);
+    }
+
+    /// @dev Audit 102ff796 (2026-10-12): a BUY call whose balanceOf read fails must be refused at post, as the
+    /// hook refuses it, instead of storing the unverifiable sentinel and taking a bond that can only be forfeited
+    /// VoidSold. A SELL call holds nothing and still posts.
+    function testBuyCallOnAnUnreadableBalanceIsRefusedLikeTheHook() public {
+        BlockedReadToken blk = new BlockedReadToken();
+        bool is0 = address(blk) < address(imd);
+        (address c0, address c1) = is0 ? (address(blk), address(imd)) : (address(imd), address(blk));
+        PoolKey memory k = PoolKey(Currency.wrap(c0), Currency.wrap(c1), 3000, 60, IHooks(GUARD));
+        manager.initialize(k, uint160(1 << 96));
+        blk.transfer(address(liquidity), 50_000_000 ether);
+        liquidity.add(k, -6000, 6000, 10_000_000 ether);
+        blk.transfer(alice, 1_000 ether);
+        T.NoteParams memory p = _xNote(T.Side.Buy, 12_000, 1, "blocked read");
+        p.x = address(blk);
+        p.venue.ref = PoolId.unwrap(k.toId());
+        annex.checkpointVenue(p, k);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.roll(vm.getBlockNumber() + 300);
+        blk.setBlocked(alice, true);
+        uint256 imdBefore = imd.balanceOf(alice);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaAnnex.InvalidNote.selector);
+        annex.post(p, k, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        assertEq(imd.balanceOf(alice), imdBefore, "nothing taken");
+        assertEq(annex.noteCount(), 0);
+        // a SELL call on the same token holds nothing and posts
+        p.side = T.Side.Sell;
+        p.targetBps = 8_000;
+        vm.prank(alice);
+        bytes32 id = annex.post(p, k, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        assertTrue(annex.noteOf(id).status == T.Status.Open);
+        // and once the read works again, the BUY call posts with the real balance
+        blk.setBlocked(alice, false);
+        p.side = T.Side.Buy;
+        p.targetBps = 12_000;
+        vm.prank(alice);
+        id = annex.post(p, k, 1 ether, 1, vm.getBlockTimestamp() + 1);
+        assertEq(annex.noteOf(id).postBalance, 1_000 ether);
     }
 
     function testEmptyTextIsRefusedLikeTheHook() public {
@@ -463,7 +551,12 @@ contract AnnexTest is Fixture {
         assertTrue(_contains(body, "0x70000000000000000000000000000000000000cc"), "the body names the hooks");
         assertTrue(_contains(body, '"answerType":"address[]"'));
         assertTrue(_contains(body, '"head":2'));
-        assertTrue(_contains(body, "A fixed fee or tax charged to every trader alike does not exclude a hook; a hook whose owner can change the fee at will"));
+        assertTrue(
+            _contains(
+                body,
+                "A fixed fee or tax charged to every trader alike does not exclude a hook; a hook whose owner can change the fee at will"
+            )
+        );
         // the panel names TAXER and a hook nobody asked about
         address[] memory open = new address[](2);
         open[0] = TAXER;
@@ -475,6 +568,51 @@ contract AnnexTest is Fixture {
         assertFalse(annex.admittedHook(GUARD), "not asked: nothing recorded (it needs no entry anyway)");
         assertTrue(annex.hookAllowed(TAXER), "an admitted taxing hook is a venue now");
         assertFalse(intake.deliver(address(annex), requestId, a, _sign(a)), "replay refused");
+    }
+
+    /// @dev Audit f662669c (2026-10-12): the body must be strict JSON (the Intake refuses anything else with the
+    /// price spent), so it is parsed here, not substring-checked: the question names every hook without raw
+    /// quotes, guards.allow carries the same list, and the question stays inside the door's 2000 characters at
+    /// the full list.
+    function testAdmissionBodyIsStrictJson() public view {
+        address[] memory hooks = new address[](2);
+        hooks[0] = TAXER;
+        hooks[1] = OTHER;
+        string memory body = annex.admissionBody(hooks);
+        string memory q = vm.parseJsonString(body, ".question");
+        assertTrue(
+            _contains(q, "0x70000000000000000000000000000000000000cc"), "question names the first hook"
+        );
+        assertTrue(_contains(q, "0x70000000000000000000000000000000000100cc"), "and the second");
+        assertEq(vm.parseJsonUint(body, ".v"), 1);
+        assertEq(vm.parseJsonUint(body, ".chainId"), block.chainid);
+        assertEq(vm.parseJsonUint(body, ".window.hours"), 24);
+        assertEq(vm.parseJsonString(body, ".answerType"), "address[]");
+        assertEq(vm.parseJsonString(body, ".evidence"), "panel");
+        assertEq(vm.parseJsonUint(body, ".head"), 2);
+        assertEq(vm.parseJsonUint(body, ".panelSize"), annex.PANEL_SIZE());
+        assertEq(vm.parseJsonUint(body, ".quorum"), annex.QUORUM());
+        assertEq(vm.parseJsonUint(body, ".validForSeconds"), 86400);
+        address[] memory allow = vm.parseJsonAddressArray(body, ".guards.allow");
+        assertEq(allow.length, 2);
+        assertEq(allow[0], TAXER);
+        assertEq(allow[1], OTHER);
+        assertTrue(vm.parseJsonBool(body, ".guards.mustHaveCode"));
+        assertEq(vm.parseJsonUint(body, ".consumer.chainId"), block.chainid);
+        assertEq(vm.parseJsonAddress(body, ".consumer.verifyingContract"), address(annex));
+        // one hook, and the full list
+        address[] memory one = new address[](1);
+        one[0] = TAXER;
+        body = annex.admissionBody(one);
+        assertEq(vm.parseJsonAddressArray(body, ".guards.allow").length, 1);
+        assertEq(vm.parseJsonUint(body, ".head"), 1);
+        address[] memory four = new address[](4);
+        for (uint256 i = 0; i < 4; ++i) {
+            four[i] = address(uint160(TAXER) + uint160(i));
+        }
+        body = annex.admissionBody(four);
+        assertEq(vm.parseJsonAddressArray(body, ".guards.allow").length, 4);
+        assertLe(bytes(vm.parseJsonString(body, ".question")).length, 2000, "the door's question limit");
     }
 
     function testAdmissionRefusesBadAnswersAndBadLists() public {
@@ -506,7 +644,9 @@ contract AnnexTest is Fixture {
         assertTrue(annex.admittedHook(TAXER));
         // list rules
         address[] memory five = new address[](5);
-        for (uint256 i = 0; i < 5; ++i) five[i] = TAXER;
+        for (uint256 i = 0; i < 5; ++i) {
+            five[i] = TAXER;
+        }
         vm.prank(carol);
         vm.expectRevert(MarginaliaAnnex.BadList.selector);
         annex.requestAdmission(five);
@@ -524,13 +664,16 @@ contract AnnexTest is Fixture {
     function testFullListFitsTheCallbackStipend() public {
         address[] memory asked = new address[](4);
         for (uint256 i = 0; i < 4; ++i) {
-            asked[i] = address(uint160(0x7000000000000000000000000000000000001000) + uint160(i * 0x100 + 0xcc));
+            asked[i] =
+                address(uint160(0x7000000000000000000000000000000000001000) + uint160(i * 0x100 + 0xcc));
             vm.etch(asked[i], address(new GuardHook()).code);
         }
         vm.prank(carol);
         bytes32 requestId = annex.requestAdmission(asked);
         OracleAttestation.Attestation memory a = _att(requestId, asked);
         assertTrue(intake.deliver(address(annex), requestId, a, _sign(a)), "four cold admissions under 200k");
-        for (uint256 i = 0; i < 4; ++i) assertTrue(annex.admittedHook(asked[i]));
+        for (uint256 i = 0; i < 4; ++i) {
+            assertTrue(annex.admittedHook(asked[i]));
+        }
     }
 }

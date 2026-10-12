@@ -1,3 +1,62 @@
+# Annex launch (evm_contracts, Ethereum mainnet) — 2026-10-12
+
+This round makes `MarginaliaAnnex` (`src/MarginaliaAnnex.sol`) the contracts-only launch: ONE contract, constructor
+`(address hook, address intake, bytes32 action, address signer)`, to be filled by the manifest step with the live
+hook `0xf0457dd0cf526686190e4f057ba19db14d34a0cc`, the Intake `0x1397434cd35e8a9C8aC312A61D3A285EB31dea56`, the
+action `0x6f7261636c652e72657175657374406f7261636c652d31000000000000000000` (the UTF-8 bytes of
+`oracle.request@oracle-1`, right-padded, not a keccak) and the signer `0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982`.
+The launch shape already held and did not change: the constructor is nonpayable, takes four static arguments,
+makes no external call (only the EIP-712 and ReentrancyGuard bases run), and stores the values; the contract has
+no owner, pause, upgrade, proxy, initializer, DELEGATECALL, CALLCODE or SELFDESTRUCT. No library function it calls
+is public or external. Every number in the brief is as it was (0.1 / 0.25 / 0.25–10 IMD, 10% target, 1–90 days,
+280 bytes, 3–16 readings 20 blocks apart over an hour, 6-hour window, 10% keeper cut, MAX_PRICE 1 IMD, list of 4,
+panel 5 / quorum 4).
+
+## Imported audit: reproduced and changed
+
+| Finding | Reproduced | Change | Test |
+| --- | --- | --- | --- |
+| `f662669c` (high): `admissionBody` inlined the quoted hook list inside the `question` string, so the body was not JSON and every admission request would be refused with the price spent. | Yes. The exact concatenation the contract produced was fed to a strict parser (Python `json.loads`): `Expecting ',' delimiter`. `test/Annex.t.sol` only substring-checked the body. | `src/MarginaliaAnnex.sol` `admissionBody`: the question now names the hooks bare (`Hooks: 0x…, 0x…`), with no quote inside the string value; `guards.allow` keeps the quoted list, `head`, `panelSize`, `quorum`, `consumer` are unchanged. The callback is untouched, so its write-set and gas are as measured before. | `testAdmissionBodyIsStrictJson` parses the body with forge's strict JSON cheatcodes (`vm.parseJson*`) for one, two and four hooks: the question names every hook, `guards.allow` carries the same addresses, `head` equals the list length, and the question stays under the door's 2000 characters at the full list. `testAdmissionAsksThePanelAndAdmitsOnlyWhatItNamed` still checks the wording. |
+| `102ff796` (low): `post` stored the `type(uint256).max` sentinel of a failed `balanceOf` as `postBalance` on a BUY call, taking a bond that could only settle `VoidSold`; the hook reverts the post instead. | Yes, by the code path: `_balanceOf` returns the sentinel on a reverting read and `post` stored it unchecked; `_broken` then holds for every reading. | `post` reverts `InvalidNote` when `side == Buy` and the read returned the sentinel, after the swap, so the whole post is atomic and nothing is taken. SELL calls hold nothing and are unchanged. | `testBuyCallOnAnUnreadableBalanceIsRefusedLikeTheHook`: a token whose `balanceOf` reverts for the author in a guard-hooked X/IMD pool; the BUY post reverts with the author's IMD untouched, a SELL call on the same token posts, and the BUY call posts with the real balance once the read works. |
+| `8b344013` (low): the `launch.json` in the tree was the previous hook launch's manifest (`kind: univ4_hook`, hook/token/pool blocks, no `MarginaliaAnnex` entry). | Yes, by reading the file. | `launch.json` is **removed**. The manifest step writes it; a stale or partial one in the tree is checked as a manifest and rejects the work. The values that step needs are the four constructor arguments above, in declaration order, and `README.md` now says so. | n/a (no contract change). |
+| `71a5281f` (info): `hookAllowed(hook)` is address-only while `validateVenue` also applies the dynamic-fee rule, so the predicate AGENTS.md points agents to said "allowed" for a guard-hooked dynamic-fee pool that `validateVenue` refuses. | Yes: `hookAllowed(GUARD)` was true and `validateVenue` on a `fee == 0x800000` key with that hook reverted `BadVenue`. | New view `hookAllowedFor(address hooks, uint24 fee)` = `hookAllowed(hooks)` plus the dynamic-fee exception; `validateVenue` now calls it, so the public predicate and the venue check cannot drift. `hookAllowed(hook)` keeps its meaning (the address-only test). `AGENTS.md` documents both. | `testDynamicFeePoolNeedsAdmissionEvenWithoutSwapBits` asserts the new view for the guard, a hookless key, the Marginalia hook and a taxing hook at a static and the dynamic fee; `testAnAdmittedHookPassesTheDynamicFeeGate` admits a taxing hook through the panel and shows the dynamic-fee gate lets it through. |
+
+## Imported audit: left alone, and why
+
+- `d6603109` (info): the Intake, action and signer are immutable and there is no owner. **The brief fixes all four
+  values and says "no owner, no pause, no upgrade"**, so no setter was added. The trust assumptions recorded for the
+  manifest notes: Intake version 1 is what the brief pins and what the live hook's judge uses; if it is ever retired,
+  `requestAdmission` reverts `BadList` on a zero price and no IMD moves; a refused body or a split panel spends the
+  asker's price and never reaches the callback (version 1 has no `requestWithFailure`), leaving `admissionLists[id]`
+  set, which holds no funds. The callback keys on the Annex's own Intake request id (`admissionLists`), so a stranger's
+  request naming the Annex as target reverts `BadList`, and a cross-chain delivery reverts `OnlyIntake`. Checked live
+  on 2026-10-12 over a public RPC: `priceOf(action, IMD)` on the Intake returns `500000000000000000` (0.5 IMD, under
+  `MAX_PRICE`); the hook returns `imd()`, `poolManager()` `0x000000000004444c5dc75cB358380D2e3dE08A90`, `token()`
+  `0xfA0EfEa559bdE229031c2B0A219472316647759c`, `getPoolKey()` (IMD, MARG, 12500, 60, the hook), `INTAKE()` and
+  `ORACLE_SIGNER()` equal to the constructor values; the guard `0x784f…6000`, the pricer `0xEaff…1cfb` and the Intake
+  have code.
+- `fd070816` (info): a coverage statement; nothing to act on.
+
+## Validation
+
+- `forge build`: passes (compiler lint warnings only, none in the Annex). `MarginaliaAnnex` runtime **24,293 bytes**
+  (EIP-170 limit 24,576), initcode 25,781 bytes.
+- `forge test --match-path test/Annex.t.sol`: **20 passed, 0 failed** (the 17 as delivered plus the 3 above).
+- `forge test --no-match-path 'test/{scratch,fork}/*'`: **283 passed, 0 failed** across 22 suites. Plain
+  `forge test` without `MAINNET_RPC_URL`: 283 passed, 0 failed, 1 skipped (the fork suite's setUp reports the
+  missing RPC; a skip is not a fork pass).
+- The supplied `Contracts.protected.t.sol` was copied unchanged to `test/scratch/` and run against the built
+  creation code with the four constructor arguments appended, a probe factory address, chain id 1 and a CREATE2
+  salt whose predicted address was computed off-line: **1 passed** (constructor runs in the empty EVM, runtime
+  present, under EIP-170, no DELEGATECALL / CALLCODE / SELFDESTRUCT). The copy lives only in scratch.
+- The Intake callback at the full 4-hook list measured **167,201 gas** in `testFullListFitsTheCallbackStipend`
+  (the 200k stipend; the review's figure was ~171k). The callback's write-set did not change.
+- Not run: `test/fork/MainnetLaunch.t.sol` (no `MAINNET_RPC_URL` in the environment); the live reads above were
+  made with `cast call` instead. No Slither, Mythril, broadcast or explorer verification is claimed.
+- No dependency, build configuration, submodule, `.git`, `.github`, environment file or `node_modules` path changed.
+
+---
+
 # Independent-review revision — 2026-10-11
 
 This is a revision of the accepted hook launch, not a new implementation. The only executable

@@ -108,6 +108,12 @@ The implementations are live (launch #1240, above). The hook launch deploys `Mar
 `$poolManager, $token, $factory`, the `Marginalia` token, and the MARG/IMD pool at LP fee 12500; its `launch.json`
 is written by the launch's manifest step. See `ADAPTATION.md` for the reproduced findings, changes and validation.
 
+The Annex launch (kind `evm_contracts`) deploys one contract, `MarginaliaAnnex`, with the four static constructor
+arguments the live hook already holds: the hook `0xf0457dd0cf526686190e4f057ba19db14d34a0cc`, the Intake
+`0x1397434cd35e8a9C8aC312A61D3A285EB31dea56`, the action `bytes32("oracle.request@oracle-1")` and the oracle signer
+`0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982`. The constructor stores them and reads no chain state. There is no
+`launch.json` in this tree: the manifest step writes it. `test/Annex.t.sol` is the Annex suite.
+
 Sealed notes: `seal(x, venue, hash)` commits to a note before it is posted. The seal pays one stamp up front
 (non-refundable, so a seal is never a free option), prices the venue's BUY and SELL baselines at that moment, and
 snapshots the author's X balance. The note is then posted through the router as usual, no sooner than 30 minutes

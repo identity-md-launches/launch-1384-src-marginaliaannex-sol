@@ -130,12 +130,16 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         string text
     );
     event Observed(bytes32 indexed id, uint256 xRead, uint256 balance);
-    event Settled(bytes32 indexed id, T.Status status, uint256 settlePrice, int256 scoreDelta, address keeper);
+    event Settled(
+        bytes32 indexed id, T.Status status, uint256 settlePrice, int256 scoreDelta, address keeper
+    );
     event Retracted(bytes32 indexed id, string text);
     event DepositClaimed(bytes32 indexed id, address indexed to, uint256 amount);
     event Burned(uint256 imdIn, uint256 marg);
     event VenueCheckpointed(bytes32 indexed venueId, uint64 startedAt);
-    event AdmissionRequested(bytes32 indexed requestId, address indexed asker, address[] hooks, uint256 price);
+    event AdmissionRequested(
+        bytes32 indexed requestId, address indexed asker, address[] hooks, uint256 price
+    );
     event HookAdmitted(address indexed hooks, bytes32 indexed requestId);
 
     /// @dev Reads no chain state: the launcher rehearses constructors in an empty EVM.
@@ -164,7 +168,16 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     /// @notice Whether this contract accepts a pool's hook: none, the Marginalia hook, one with no swap
     /// permission, or one the oracle panel admitted.
     function hookAllowed(address hooks) public view returns (bool) {
-        return hooks == address(0) || hooks == address(hook) || !hookCanTouchSwaps(hooks) || admittedHook[hooks];
+        return
+            hooks == address(0) || hooks == address(hook) || !hookCanTouchSwaps(hooks) || admittedHook[hooks];
+    }
+
+    /// @notice The whole hook rule for one pool: `hookAllowed` plus the dynamic-fee exception. On a pool whose
+    /// `fee` is the dynamic flag the hook sets the LP fee with no permission bit, so only the Marginalia hook or
+    /// an admitted one passes there. This is the predicate `validateVenue` applies.
+    function hookAllowedFor(address hooks, uint24 fee) public view returns (bool) {
+        if (!hookAllowed(hooks)) return false;
+        return fee != LPFeeLibrary.DYNAMIC_FEE_FLAG || hooks == address(hook) || admittedHook[hooks];
     }
 
     /// @notice The venue check: a live v4 pool, allowed hook, X on one side, IMD / WETH / ETH on the other.
@@ -176,11 +189,7 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         address imd = hook.imd();
         if (p.x == address(0) || p.x == imd || p.x.code.length == 0) revert InvalidNote();
         if (v.kind != T.VenueKind.UniV4 || PoolId.unwrap(key.toId()) != v.ref) revert BadVenue();
-        address hooks = address(key.hooks);
-        if (!hookAllowed(hooks)) revert BadVenue();
-        if (key.fee == LPFeeLibrary.DYNAMIC_FEE_FLAG && hooks != address(hook) && !admittedHook[hooks]) {
-            revert BadVenue();
-        }
+        if (!hookAllowedFor(address(key.hooks), key.fee)) revert BadVenue();
         if (hook.poolManager().getLiquidity(PoolId.wrap(v.ref)) == 0) revert BadVenue();
         address t0 = Currency.unwrap(key.currency0);
         address t1 = Currency.unwrap(key.currency1);
@@ -221,11 +230,13 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     /// author; one swap buys MARG with both, the purchase's share goes to the author and the stamp's share is
     /// burned, the bond stays here. `minMargOut` bounds the author's share. `p.venue` is the derived venue as
     /// `validateVenue` returns it (a site computes it the same way).
-    function post(T.NoteParams calldata p, PoolKey calldata v4Key, uint256 bond, uint256 minMargOut, uint256 deadline)
-        external
-        nonReentrant
-        returns (bytes32 id)
-    {
+    function post(
+        T.NoteParams calldata p,
+        PoolKey calldata v4Key,
+        uint256 bond,
+        uint256 minMargOut,
+        uint256 deadline
+    ) external nonReentrant returns (bytes32 id) {
         if (block.timestamp > deadline) revert Expired();
         if (bond < BOND_MIN || bond > BOND_MAX) revert InvalidNote();
         if (p.targetBps == 0 || p.horizonDays == 0 || p.horizonDays > MAX_HORIZON_DAYS) revert InvalidNote();
@@ -258,6 +269,8 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         // read AFTER the purchase: the author already holds the MARG (the hook adds it because it records inside
         // afterSwap, before the router's take; here the take has happened)
         n.postBalance = _balanceOf(p.x, author);
+        // a BUY call whose balance cannot be read could only settle VoidSold: refused at post, as on the hook
+        if (p.side == T.Side.Buy && n.postBalance == type(uint256).max) revert InvalidNote();
         n.postPrice = postPrice(v, p.side == T.Side.Buy);
         if (n.postPrice == 0) revert InvalidNote();
 
@@ -271,7 +284,9 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     function _checkCounter(T.NoteParams calldata p, address author) private view {
         T.Note storage t = notes[p.parentId];
         if (t.author != address(0)) {
-            if (t.author == author || t.status != T.Status.Open || t.x != p.x || t.side == p.side) revert InvalidNote();
+            if (t.author == author || t.status != T.Status.Open || t.x != p.x || t.side == p.side) {
+                revert InvalidNote();
+            }
             return;
         }
         try hook.noteOf(p.parentId) returns (T.NoteView memory h) {
@@ -299,7 +314,8 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         T.Observation[] storage obs = observations[id];
         (uint256 xRead, uint256 quoteRead) = pricer().observe(hook.poolManager(), n.venue, hook.imd());
         uint256 balance = _balanceOf(n.x, n.author);
-        T.Observation memory o = T.Observation(uint64(block.timestamp), uint64(block.number), xRead, quoteRead, balance);
+        T.Observation memory o =
+            T.Observation(uint64(block.timestamp), uint64(block.number), xRead, quoteRead, balance);
         uint256 len = obs.length;
         if (
             len > 0
@@ -333,9 +349,11 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
                 if (_broken(n, obs[i].balance)) held = false;
             }
             settlePrice = _settlementPrice(n, obs);
-            if (settlePrice == 0) outcome = T.Status.VoidNoData;
-            else if (!held) outcome = T.Status.VoidSold;
-            else if (n.side == T.Side.Buy) {
+            if (settlePrice == 0) {
+                outcome = T.Status.VoidNoData;
+            } else if (!held) {
+                outcome = T.Status.VoidSold;
+            } else if (n.side == T.Side.Buy) {
                 outcome = settlePrice * 10_000 >= n.postPrice * n.targetBps ? T.Status.Right : T.Status.Wrong;
             } else {
                 outcome = settlePrice * 10_000 <= n.postPrice * n.targetBps ? T.Status.Right : T.Status.Wrong;
@@ -401,7 +419,11 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     }
 
     /// @dev v4 venues are spot-read: the pricer prices each observation alone and the most adverse one settles.
-    function _settlementPrice(T.Note storage n, T.Observation[] memory obs) private view returns (uint256 price) {
+    function _settlementPrice(T.Note storage n, T.Observation[] memory obs)
+        private
+        view
+        returns (uint256 price)
+    {
         bool buy = n.side == T.Side.Buy;
         T.Observation[] memory sample = new T.Observation[](1);
         for (uint256 i; i < obs.length; ++i) {
@@ -415,7 +437,11 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         }
     }
 
-    function _moreAdverse(T.Note storage n, T.Observation memory o, T.Observation memory last) private view returns (bool) {
+    function _moreAdverse(T.Note storage n, T.Observation memory o, T.Observation memory last)
+        private
+        view
+        returns (bool)
+    {
         bool brokenNew = _broken(n, o.balance);
         bool brokenLast = _broken(n, last.balance);
         if (brokenLast && !brokenNew) return false;
@@ -431,13 +457,15 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     }
 
     function _balanceOf(address x, address who) private view returns (uint256) {
-        (bool ok, bytes memory ret) = x.staticcall{gas: BALANCE_READ_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, who));
+        (bool ok, bytes memory ret) =
+            x.staticcall{gas: BALANCE_READ_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, who));
         if (!ok || ret.length < 32) return type(uint256).max;
         return abi.decode(ret, (uint256));
     }
 
     function _difficulty(T.Note storage n) private view returns (uint256) {
-        (bool ok, bytes memory ret) = n.x.staticcall{gas: BALANCE_READ_GAS}(abi.encodeWithSelector(IERC20.totalSupply.selector));
+        (bool ok, bytes memory ret) =
+            n.x.staticcall{gas: BALANCE_READ_GAS}(abi.encodeWithSelector(IERC20.totalSupply.selector));
         uint256 supply = ok && ret.length >= 32 ? abi.decode(ret, (uint256)) : 0;
         uint256 mcap = supply <= type(uint256).max / n.postPrice ? n.postPrice * supply / 1e18 : 0;
         return pricer().difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
@@ -453,7 +481,18 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     function noteOf(bytes32 id) external view returns (T.NoteView memory v) {
         T.Note storage n = notes[id];
         v = T.NoteView(
-            n.author, n.x, n.side, n.targetBps, n.horizonDays, n.class, n.status, n.postPrice, n.postBalance, n.deposit, n.parentId, n.children
+            n.author,
+            n.x,
+            n.side,
+            n.targetBps,
+            n.horizonDays,
+            n.class,
+            n.status,
+            n.postPrice,
+            n.postBalance,
+            n.deposit,
+            n.parentId,
+            n.children
         );
     }
 
@@ -473,18 +512,21 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
     /// alike is not a reason to refuse a hook; an allowlist, a pause, an owner-set fee or price, or an upgrade
     /// path is (an admission is permanent, so what the owner could do tomorrow counts).
     function admissionBody(address[] memory hooks) public view returns (string memory) {
-        bytes memory list;
+        bytes memory list; // quoted, for guards.allow
+        bytes memory named; // bare, for the question: a quote inside a JSON string value breaks the body
         for (uint256 i = 0; i < hooks.length; ++i) {
-            list = bytes.concat(list, i == 0 ? bytes('"') : bytes(',"'), bytes(Strings.toHexString(hooks[i])), bytes('"'));
+            bytes memory h = bytes(Strings.toHexString(hooks[i]));
+            list = bytes.concat(list, i == 0 ? bytes('"') : bytes(',"'), h, bytes('"'));
+            named = bytes.concat(named, i == 0 ? bytes("") : bytes(", "), h);
         }
         bytes memory chain = bytes(Strings.toString(block.chainid));
         return string(
             bytes.concat(
                 bytes(
-                    '{"v":1,"question":"Each address is a Uniswap v4 hook on this chain with verified source. Answer with the subset that keeps its pools OPEN: any caller may swap (no allowlist, selective refusal or selective pause) and the pool price moves only through swaps and liquidity changes any caller may make (no owner-set price, no privileged swap path). A fixed fee or tax charged to every trader alike does not exclude a hook; a hook whose owner can change the fee at will, pause swaps for everyone, or that is upgradeable, is NOT open. Read the source; never infer from names. Hooks: ['
+                    '{"v":1,"question":"Each address is a Uniswap v4 hook on this chain with verified source. Answer with the subset that keeps its pools OPEN: any caller may swap (no allowlist, selective refusal or selective pause) and the pool price moves only through swaps and liquidity changes any caller may make (no owner-set price, no privileged swap path). A fixed fee or tax charged to every trader alike does not exclude a hook; a hook whose owner can change the fee at will, pause swaps for everyone, or that is upgradeable, is NOT open. Read the source; never infer from names. Hooks: '
                 ),
-                list,
-                bytes(']","chainId":'),
+                named,
+                bytes('","chainId":'),
                 chain,
                 bytes(',"window":{"hours":24},"answerType":"address[]","evidence":"panel","head":'),
                 bytes(Strings.toString(hooks.length)),
@@ -516,7 +558,11 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         IERC20(imd).safeTransferFrom(msg.sender, address(this), price);
         IERC20(imd).forceApprove(address(intake), price);
         requestId = intake.request(
-            action, bytes(admissionBody(hooks)), IIntake.Callback(address(this), this.onOracleResult.selector), imd, price
+            action,
+            bytes(admissionBody(hooks)),
+            IIntake.Callback(address(this), this.onOracleResult.selector),
+            imd,
+            price
         );
         IERC20(imd).forceApprove(address(intake), 0);
         if (requestId == bytes32(0) || admissionLists[requestId].length != 0) revert BadList();
@@ -524,15 +570,18 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         emit AdmissionRequested(requestId, msg.sender, hooks, price);
     }
 
-    function onOracleResult(bytes32 requestId, OracleAttestation.Attestation calldata a, bytes calldata signature)
-        external
-        nonReentrant
-    {
+    function onOracleResult(
+        bytes32 requestId,
+        OracleAttestation.Attestation calldata a,
+        bytes calldata signature
+    ) external nonReentrant {
         if (msg.sender != address(intake)) revert OnlyIntake();
         address[] memory asked = admissionLists[requestId];
         if (asked.length == 0) revert BadList();
         _verifyAttestation(a, signature);
-        if (a.chainId != block.chainid || a.agreed < a.quorum || a.quorum < QUORUM || a.panelSize < PANEL_SIZE) {
+        if (
+            a.chainId != block.chainid || a.agreed < a.quorum || a.quorum < QUORUM || a.panelSize < PANEL_SIZE
+        ) {
             revert BadAnswer();
         }
         address[] memory open = decodeAddressList(a);
@@ -566,7 +615,13 @@ contract MarginaliaAnnex is IUnlockCallback, ReentrancyGuard, OracleAttestationC
         address imd = hook.imd();
         bool zeroForOne = Currency.unwrap(key.currency0) == imd;
         BalanceDelta d = manager.swap(
-            key, SwapParams(zeroForOne, -int256(imdIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), ""
+            key,
+            SwapParams(
+                zeroForOne,
+                -int256(imdIn),
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
+            ""
         );
         int128 inD = zeroForOne ? d.amount0() : d.amount1();
         int128 outD = zeroForOne ? d.amount1() : d.amount0();
